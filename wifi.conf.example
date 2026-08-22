@@ -1,0 +1,5 @@
+# Copy this file to wifi.conf (gitignored) and fill in your network.
+# flash_all.ps1 picks it up automatically and rebuilds/flashes with it.
+# Avoid quotes and backslashes in values.
+WIFI_SSID=your-network-name
+WIFI_PASSWORD=your-password

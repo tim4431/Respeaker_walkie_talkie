@@ -1,0 +1,35 @@
+menu "Walkie-Talkie Configuration"
+
+    config WT_WIFI_SSID
+        string "WiFi SSID"
+        default "myssid"
+
+    config WT_WIFI_PASSWORD
+        string "WiFi password"
+        default "mypassword"
+
+    config WT_UDP_PORT
+        int "UDP port"
+        default 5004
+
+    config WT_PEER_IP
+        string "Static peer IP (empty = mDNS auto-discovery)"
+        default ""
+        help
+            Leave empty to discover the other unit automatically via mDNS
+            (_walkie._udp). Set to a fixed IPv4 address to skip discovery.
+
+    config WT_OPUS_BITRATE
+        int "Opus bitrate (bps)"
+        range 8000 64000
+        default 24000
+
+    config WT_OPUS_COMPLEXITY
+        int "Opus encoder complexity (0-10)"
+        range 0 10
+        default 3
+        help
+            Lower this if the capture task can't keep up (watch for
+            "encode overrun" warnings in the log).
+
+endmenu
