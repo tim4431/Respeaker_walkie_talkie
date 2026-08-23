@@ -5,5 +5,6 @@ sdkconfig.old
 dependencies.lock
 wifi.conf
 pc_client/*.txt
+pc_client/gui_settings.json
 __pycache__/
 *.py[cod]

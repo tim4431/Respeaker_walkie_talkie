@@ -14,14 +14,22 @@
 #include "jitter_buffer.h"
 #include "net.h"
 #include "led.h"
+#include "console.h"
 
 static const char *TAG = "walkie";
-#define WT_BUILD_TAG "WTKI-2026-08-22-C"
+#define WT_BUILD_TAG "WTKI-2026-08-22-H"
 
 static volatile bool s_muted = false;
 static volatile uint8_t s_volume = 100;     /* speaker volume percent, 0-100 */
 static volatile bool s_vol_dirty = false;   /* pending NVS save (debounced) */
 static volatile int64_t s_vol_change_us = 0;
+static volatile uint8_t s_tx_mode = WT_TXMODE_ALWAYS;  /* NVS-persisted */
+static volatile bool s_tx_active = false;   /* transmitting right now */
+static volatile uint8_t s_mic_level = 0;    /* latest frame peak >> 7 */
+static volatile uint8_t s_vox_sens = WT_VOX_SENS_DEFAULT;  /* NVS-persisted */
+static volatile uint8_t s_mic_gain = 100;   /* percent, 0-200, NVS-persisted */
+static volatile int64_t s_last_play_us = 0; /* last real far-end frame played */
+static nvs_handle_t s_nvs;
 static volatile uint32_t s_rx_dgrams = 0;   /* all valid datagrams */
 static volatile uint32_t s_rx_ctrl = 0;     /* ctrl requests handled */
 static volatile uint32_t s_tx_ctrl = 0;     /* ctrl replies sent OK */
@@ -47,17 +55,34 @@ static void capture_task(void *arg)
     uint16_t batch_seq = 0;
     int64_t batch_t0 = 0;
 
+    int64_t vox_hold_until = 0;
+
     for (;;) {
         if (audio_capture(pcm) != ESP_OK) {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
+        /* digital mic gain first: level reporting, VOX and encoding all see
+         * the scaled signal, so the number matches what the UIs draw */
+        uint8_t gain = s_mic_gain;
+        if (gain != 100) {
+            int32_t q = ((int32_t)gain << 15) / 100;
+            for (int i = 0; i < WT_FRAME_SAMPLES; i++) {
+                int32_t v = ((int32_t)pcm[i] * q) >> 15;
+                if (v > 32767) v = 32767;
+                if (v < -32768) v = -32768;
+                pcm[i] = (int16_t)v;
+            }
+        }
         /* mic health telemetry every ~2 s: peak of converted samples, peak of
-         * raw 32-bit slot, and how many frames actually went out (DTX) */
+         * raw 32-bit slot, and how many frames actually went out */
+        int16_t fpeak = 0;  /* this frame's peak drives the VOX gate */
         for (int i = 0; i < WT_FRAME_SAMPLES; i++) {
             int16_t a = pcm[i] < 0 ? -pcm[i] : pcm[i];
-            if (a > peak) peak = a;
+            if (a > fpeak) fpeak = a;
         }
+        if (fpeak > peak) peak = fpeak;
+        s_mic_level = (uint8_t)(fpeak >> 7);  /* live level for UIs */
         int32_t rp = audio_last_raw_peak();
         if (rp > raw_peak) raw_peak = rp;
         if (++frames >= 100) {
@@ -68,7 +93,22 @@ static void capture_task(void *arg)
             s_rx_dgrams = 0;
         }
         bool tcp_active = (s_tcp_fd >= 0);
-        if (s_muted || (!tcp_active && !net_peer_known())) {
+        bool have_route = tcp_active || net_group_size() > 0 || net_peer_known();
+        bool gate = true;
+        if (s_tx_mode == WT_TXMODE_VOX) {
+            /* transmit only on local speech while our speaker is quiet;
+             * the XMOS AEC keeps speaker audio out of the mic, so the
+             * far end can't hold the gate open. */
+            int64_t nowv = esp_timer_get_time();
+            int32_t th = 1000 + (100 - (int32_t)s_vox_sens) * 190;
+            if (fpeak >= th &&
+                nowv - s_last_play_us > WT_VOX_RX_BLOCK_US) {
+                vox_hold_until = nowv + WT_VOX_TX_HANG_US;
+            }
+            gate = nowv < vox_hold_until;
+        }
+        s_tx_active = have_route && !s_muted && gate;
+        if (!s_tx_active) {
             batch_cnt = 0;               /* drop any half-built batch */
             batch_len = sizeof(wt_header_t);
             continue;  /* keep draining I2S; the frame is paced by the XMOS clock */
@@ -86,10 +126,15 @@ static void capture_task(void *arg)
         }
 
         if (tcp_active) {
-            /* TCP peer (the PC) takes priority over any UDP peer */
             if (n > 0 && tcp_send_frame(enc_buf, n)) {
                 sent++;
             }
+        }
+        /* UDP path: group members always; the adopted/manual peer only
+         * when no TCP client is being served (TCP wins a 1:1 call). */
+        bool udp_route = net_group_size() > 0 ||
+                         (!tcp_active && net_peer_known());
+        if (!udp_route) {
             batch_cnt = 0;
             batch_len = sizeof(wt_header_t);
             continue;
@@ -124,7 +169,7 @@ static void capture_task(void *arg)
                 .version = WT_PROTO_VERSION,
             };
             memcpy(pkt, &hdr, sizeof(hdr));
-            net_send(pkt, batch_len);
+            net_send_all(pkt, batch_len);
             sent += batch_cnt;
             batch_cnt = 0;
             batch_len = sizeof(wt_header_t);
@@ -144,6 +189,13 @@ static bool send_status_reply(const struct sockaddr_in *dst)
     wt_status_t *st = (wt_status_t *)(rsp + sizeof(rh));
     net_fill_status(st, s_muted);
     st->volume = s_volume;
+    st->tx_mode = s_tx_mode;
+    st->tx_active = s_tx_active ? 1 : 0;
+    st->rx_active =
+        (esp_timer_get_time() - s_last_play_us < 400 * 1000) ? 1 : 0;
+    st->mic_level = s_mic_level;
+    st->vox_sens = s_vox_sens;
+    st->mic_gain = s_mic_gain;
     if (s_tcp_fd >= 0) {  /* a TCP call counts as linked */
         st->linked = 1;
     }
@@ -204,6 +256,58 @@ static void rx_task(void *arg)
                     ESP_LOGI(TAG, "speaker volume set to %u%%", (unsigned)vol);
                 }
                 send_status_reply(&src);
+            } else if (cmd == WT_CTRL_SET_MODE && payload >= 2) {
+                uint8_t m = buf[sizeof(wt_header_t) + 1] ? WT_TXMODE_VOX
+                                                         : WT_TXMODE_ALWAYS;
+                if (m != s_tx_mode) {
+                    s_tx_mode = m;
+                    if (s_nvs) {
+                        nvs_set_u8(s_nvs, "tx_mode", m);
+                        nvs_commit(s_nvs);
+                    }
+                    ESP_LOGI(TAG, "tx mode: %s",
+                             m == WT_TXMODE_VOX ? "voice" : "always");
+                }
+                send_status_reply(&src);
+            } else if (cmd == WT_CTRL_SET_SENS && payload >= 2) {
+                uint8_t sv = buf[sizeof(wt_header_t) + 1];
+                if (sv > 100) {
+                    sv = 100;
+                }
+                if (sv != s_vox_sens) {
+                    s_vox_sens = sv;
+                    if (s_nvs) {
+                        nvs_set_u8(s_nvs, "vox_sens", sv);
+                        nvs_commit(s_nvs);
+                    }
+                    ESP_LOGI(TAG, "mic sensitivity set to %u", (unsigned)sv);
+                }
+                send_status_reply(&src);
+            } else if (cmd == WT_CTRL_SET_GAIN && payload >= 2) {
+                uint8_t gv = buf[sizeof(wt_header_t) + 1];
+                if (gv > 200) {
+                    gv = 200;
+                }
+                if (gv != s_mic_gain) {
+                    s_mic_gain = gv;
+                    if (s_nvs) {
+                        nvs_set_u8(s_nvs, "mic_gain", gv);
+                        nvs_commit(s_nvs);
+                    }
+                    ESP_LOGI(TAG, "mic gain set to %u%%", (unsigned)gv);
+                }
+                send_status_reply(&src);
+            } else if (cmd == WT_CTRL_SET_MUTE && payload >= 2) {
+                s_muted = buf[sizeof(wt_header_t) + 1] != 0;
+                ESP_LOGI(TAG, "mic %s (remote)", s_muted ? "muted" : "live");
+                send_status_reply(&src);
+            } else if (cmd == WT_CTRL_SET_GROUP && payload >= 2) {
+                int count = buf[sizeof(wt_header_t) + 1];
+                if (count <= WT_MAX_MEMBERS &&
+                    payload >= 2 + count * (int)sizeof(wt_member_t)) {
+                    net_set_group(buf + sizeof(wt_header_t) + 2, count);
+                }
+                send_status_reply(&src);
             }
             continue;
         }
@@ -213,6 +317,22 @@ static void rx_task(void *arg)
          * stream: its seq space (0,1,2,...) is unrelated to a UDP peer's, and
          * interleaving the two garbles playback into noise. TCP wins. */
         if ((hdr.flags & WT_FLAG_AUDIO) && payload > 0 && s_tcp_fd < 0) {
+            /* Group audio: one speaker holds the floor at a time. A source
+             * owns playback until it has been silent for WT_SPK_LOCK_US;
+             * other members' audio is dropped meanwhile (their seq spaces
+             * are unrelated - mixing them would garble the buffer). */
+            static uint32_t spk_ip;
+            static uint16_t spk_port;
+            static int64_t spk_last_us;
+            int64_t nowr = esp_timer_get_time();
+            if (src.sin_addr.s_addr != spk_ip || src.sin_port != spk_port) {
+                if (nowr - spk_last_us < WT_SPK_LOCK_US) {
+                    continue;
+                }
+                spk_ip = src.sin_addr.s_addr;
+                spk_port = src.sin_port;
+            }
+            spk_last_us = nowr;
             /* v2: [u16 len][opus frame] repeated, consecutive seq */
             const uint8_t *p = buf + sizeof(wt_header_t);
             int rem = payload;
@@ -273,9 +393,11 @@ static void playback_task(void *arg)
         if (jb_take(expect, buf, &len)) {
             codec_decode(buf, len, pcm);
             misses = 0;
+            s_last_play_us = esp_timer_get_time();
         } else if (jb_peek((uint16_t)(expect + 1), buf, &len)) {
             codec_decode_fec(buf, len, pcm);  /* recover from next packet's FEC */
             misses++;
+            s_last_play_us = esp_timer_get_time();
         } else {
             codec_decode(NULL, 0, pcm);       /* packet-loss concealment */
             misses++;
@@ -437,12 +559,10 @@ static void tcp_srv_task(void *arg)
 
 /* ---------------- housekeeping: button, LED, discovery, keepalive ------- */
 
-static nvs_handle_t s_nvs;
-
-static void volume_nvs_load(void)
+static void settings_nvs_load(void)
 {
     if (nvs_open("walkie", NVS_READWRITE, &s_nvs) != ESP_OK) {
-        ESP_LOGW(TAG, "nvs_open failed; volume will not persist");
+        ESP_LOGW(TAG, "nvs_open failed; settings will not persist");
         s_nvs = 0;
         return;
     }
@@ -450,6 +570,19 @@ static void volume_nvs_load(void)
     if (nvs_get_u8(s_nvs, "spk_vol", &v) == ESP_OK && v <= 100) {
         s_volume = v;
         ESP_LOGI(TAG, "speaker volume restored: %u%%", (unsigned)v);
+    }
+    if (nvs_get_u8(s_nvs, "tx_mode", &v) == ESP_OK && v <= WT_TXMODE_VOX) {
+        s_tx_mode = v;
+        ESP_LOGI(TAG, "tx mode restored: %s",
+                 v == WT_TXMODE_VOX ? "voice" : "always");
+    }
+    if (nvs_get_u8(s_nvs, "vox_sens", &v) == ESP_OK && v <= 100) {
+        s_vox_sens = v;
+        ESP_LOGI(TAG, "mic sensitivity restored: %u", (unsigned)v);
+    }
+    if (nvs_get_u8(s_nvs, "mic_gain", &v) == ESP_OK && v <= 200) {
+        s_mic_gain = v;
+        ESP_LOGI(TAG, "mic gain restored: %u%%", (unsigned)v);
     }
 }
 
@@ -519,8 +652,8 @@ static void housekeeping_loop(void)
             if (s_tcp_fd >= 0) {
                 tcp_send_frame(NULL, 0);  /* heartbeat keeps liveness fresh */
             }
-            if (net_peer_known()) {
-                net_send(&ka, sizeof(ka));
+            if (net_peer_known() || net_group_size() > 0) {
+                net_send_all(&ka, sizeof(ka));
             }
             if ((ka_seq & 1) == 0) {
                 net_send_presence(&ka, sizeof(ka));
@@ -550,7 +683,11 @@ void app_main(void)
     led_init();
     led_set_state(LED_STATE_WIFI_CONNECTING);
     s_tcp_tx_lock = xSemaphoreCreateMutex();
-    volume_nvs_load();
+    settings_nvs_load();
+
+    /* Console first: a factory-fresh unit has no WiFi credentials and must
+     * be configurable over USB while net_wifi_start() waits for a network. */
+    console_start(WT_BUILD_TAG);
 
     ESP_ERROR_CHECK(net_wifi_start());
     ESP_ERROR_CHECK(net_udp_start());

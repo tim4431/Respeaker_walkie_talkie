@@ -17,6 +17,7 @@ cancellation, so open speakers will feed your mic.
 """
 
 import argparse
+import math
 import socket
 import struct
 import sys
@@ -45,6 +46,16 @@ PORT = 5004
 JB_PREFILL = 3
 JB_MAX_AHEAD = 32
 LOSS_RESET = 25
+
+# Voice-activated ("vox") TX mode: the PC has no echo canceller, so in this
+# mode the mic transmits only while it hears local speech AND the far end is
+# quiet - the device's audio can then never loop speakers->mic->device.
+# The TX threshold comes from the client's vox_sens (0-100, higher = opens
+# easier): rms_threshold = 50 + (100 - sens) * 19.5  (sens 75 ~ RMS 540).
+VOX_SENS_DEFAULT = 75
+VOX_RX_RMS = 250.0   # far-end RMS that counts as "someone else speaking"
+VOX_TX_HANG = 0.6    # keep transmitting this long after the last voiced frame
+VOX_RX_HANG = 0.4    # keep TX blocked this long after far-end speech
 
 
 def discover_device(timeout=10.0):
@@ -99,6 +110,13 @@ class Jitter:
             self.slots[seq] = data
             if len(self.slots) == 1 or seq_dist(seq, self.head) > 0:
                 self.head = seq
+            # Evict entries the consumer has moved past: unlike the
+            # firmware's ring buffer, a dict never overwrites stale slots,
+            # and they would inflate depth() forever.
+            if len(self.slots) > JB_MAX_AHEAD:
+                for k in [k for k in self.slots
+                          if seq_dist(self.head, k) > JB_MAX_AHEAD]:
+                    del self.slots[k]
 
     def take(self, seq):
         with self.lock:
@@ -122,6 +140,10 @@ class WalkieClient:
 
     Readable attributes (updated continuously, safe to read from any thread):
       muted        - set True/False to stop/resume sending mic audio
+      mode         - 'full' (always transmit) or 'vox' (transmit only while
+                     speaking and the far end is quiet; suppresses echo on
+                     PCs with open speakers)
+      tx_active    - True while the mic is actually being transmitted
       rx_volume    - playback gain for the PC speakers (1.0 = unity, may
                      exceed 1.0; output is clamped to int16)
       tx_count     - datagrams sent
@@ -132,19 +154,36 @@ class WalkieClient:
       jb_depth()   - current jitter buffer depth in frames
     """
 
-    def __init__(self, target, sock=None, external_rx=False):
+    def __init__(self, target=None, sock=None, external_rx=False,
+                 targets=None, use_tcp=True):
         """Audio transport is TCP on target_port+1 (this router forwards TCP
         perfectly while randomly blackholing UDP flows); falls back to the
         v2 UDP protocol if the TCP connect fails (older firmware).
 
         sock/external_rx: share an existing UDP socket whose flow the router
         already forwards - the owner then feeds incoming audio via
-        handle_audio() instead of our own rx loop. UDP fallback only."""
-        self.target = target
+        handle_audio() instead of our own rx loop. UDP fallback only.
+
+        targets/use_tcp=False: group mode - mic audio is sent by UDP to every
+        address in `targets`, and received group audio (fed via handle_audio
+        with src set) plays one speaker at a time."""
+        self.targets = [tuple(t) for t in (targets or
+                                           ([] if target is None else [target]))]
+        self.target = target if target else (
+            self.targets[0] if self.targets else None)
         self.build_tag = None  # device firmware id from its TCP banner
-        self.tcp = self._tcp_connect(timeout=3.0)  # None -> UDP fallback
+        self.tcp = (self._tcp_connect(timeout=3.0)
+                    if (use_tcp and self.target) else None)
+        self._spk_src = None      # group floor: current speaker (addr)
+        self._spk_last = 0.0
         self.muted = False
+        self.mode = "full"
+        self.tx_active = False
+        self.vox_sens = VOX_SENS_DEFAULT  # 0-100, see VOX_SENS_DEFAULT note
+        self.tx_gain = 1.0   # mic gain (0.0-2.0); scales level/VOX/encode
         self.rx_volume = 1.0
+        self._tx_hold_until = 0.0
+        self._rx_active_until = 0.0
         self.tx_count = 0
         self.rx_count = 0
         self.last_rx_time = 0.0
@@ -177,6 +216,52 @@ class WalkieClient:
 
     def linked(self):
         return time.monotonic() - self.last_rx_time < 3.0
+
+    def accepts(self, ip):
+        """Is this ip one of our audio sources (any target)?"""
+        return any(ip == t[0] for t in self.targets)
+
+    def _apply_tx_gain(self, pcm):
+        """Scale a mic frame by tx_gain (saturating) - the waveform, VOX
+        gate and encoder all see the scaled signal."""
+        gain = self.tx_gain
+        if gain == 1.0 or not pcm:
+            return pcm
+        samples = array("h")
+        samples.frombytes(pcm)
+        return array("h", (
+            min(32767, max(-32768, int(s * gain)))
+            for s in samples)).tobytes()
+
+    @staticmethod
+    def _rms(pcm):
+        if not pcm:
+            return 0.0
+        samples = memoryview(pcm).cast("h")
+        step = max(1, len(samples) // 160)  # subsample: plenty for a level
+        acc = 0
+        n = 0
+        for i in range(0, len(samples), step):
+            s = samples[i]
+            acc += s * s
+            n += 1
+        return math.sqrt(acc / max(n, 1))
+
+    def _tx_allowed(self, pcm):
+        """Gate for one mic frame; also maintains tx_active for UIs."""
+        if self.muted:
+            self.tx_active = False
+            return False
+        if self.mode != "vox":
+            self.tx_active = True
+            return True
+        now = time.monotonic()
+        # far end has priority: local speech only opens TX while RX is quiet
+        th = 50 + (100 - self.vox_sens) * 19.5
+        if self._rms(pcm) >= th and now >= self._rx_active_until:
+            self._tx_hold_until = now + VOX_TX_HANG
+        self.tx_active = now < self._tx_hold_until
+        return self.tx_active
 
     def _rebind(self):
         """Move to a fresh source port: some routers' flow-offload engines
@@ -252,9 +337,9 @@ class WalkieClient:
                                blocksize=FRAME) as mic:
             while not self._stop.is_set():
                 pcm, _ = mic.read(FRAME)
-                pcm = bytes(pcm)
+                pcm = self._apply_tx_gain(bytes(pcm))
                 self.last_tx_pcm = pcm
-                if self.muted:
+                if not self._tx_allowed(pcm):
                     # heartbeat so the device knows we're alive, not a zombie
                     now = time.monotonic()
                     if now - last_hb > 0.5:
@@ -313,8 +398,20 @@ class WalkieClient:
             self.jb.insert(seq, frame)
             seq = (seq + 1) & 0xFFFF
 
-    def handle_audio(self, seq, body):
-        """Feed a received audio payload (v2 batch, header stripped)."""
+    def handle_audio(self, seq, body, src=None):
+        """Feed a received audio payload (v2 batch, header stripped).
+
+        src (ip, port): group mode - one speaker holds the floor at a time;
+        another member's audio is dropped until the current one has been
+        silent for 0.4 s (seq spaces are unrelated between sources)."""
+        if src is not None:
+            now = time.monotonic()
+            if src != self._spk_src:
+                if now - self._spk_last < 0.4:
+                    return
+                self._spk_src = src
+                self.jb.clear()
+            self._spk_last = now
         self.last_rx_time = time.monotonic()
         self.rx_count += 1
         pos = 0
@@ -335,9 +432,9 @@ class WalkieClient:
                                blocksize=FRAME) as mic:
             while not self._stop.is_set():
                 pcm, _ = mic.read(FRAME)
-                pcm = bytes(pcm)
+                pcm = self._apply_tx_gain(bytes(pcm))
                 self.last_tx_pcm = pcm
-                if self.muted:
+                if not self._tx_allowed(pcm):
                     batch.clear()
                     continue
                 packet = bytes(self.enc.encode(pcm))
@@ -348,11 +445,13 @@ class WalkieClient:
                 if len(batch) < FRAMES_PER_PKT:
                     continue
                 hdr = HDR.pack(MAGIC, batch_seq & 0xFFFF, FLAG_AUDIO, VERSION)
-                try:
-                    self.sock.sendto(hdr + b"".join(batch), self.target)
-                except OSError:
-                    if self._stop.is_set():
-                        break
+                pkt_out = hdr + b"".join(batch)
+                for tgt in self.targets:
+                    try:
+                        self.sock.sendto(pkt_out, tgt)
+                    except OSError:
+                        if self._stop.is_set():
+                            break
                 self.tx_count += len(batch)
                 batch.clear()
                 # flow watchdog: sending but hearing nothing -> new flow
@@ -404,6 +503,18 @@ class WalkieClient:
                         continue
                 pkt = self.jb.take(expect)
                 expect = (expect + 1) & 0xFFFF
+                # backlog/drift control (mirrors the firmware): if playback
+                # lags the newest frame by more than 8 frames (~160 ms),
+                # consume an extra frame to re-center latency
+                if (pkt is not None
+                        and seq_dist(self.jb.head_seq(), expect) > 8):
+                    extra = self.jb.take(expect)
+                    if extra is not None:
+                        expect = (expect + 1) & 0xFFFF
+                        try:  # decode+discard keeps the decoder state intact
+                            self.dec.decode(memoryview(bytearray(extra)))
+                        except Exception:
+                            pass
                 if pkt is not None:
                     misses = 0
                     try:
@@ -420,6 +531,13 @@ class WalkieClient:
                         playing = False
                 # waveform shows the device's signal regardless of local gain
                 self.last_rx_pcm = pcm
+                # vox: far-end speech blocks our TX from opening. Ignore RX
+                # while we transmit - the device's AEC has already stripped
+                # our own voice, and residual echo must not cut us off.
+                if (self.mode == "vox" and not self.tx_active
+                        and pkt is not None
+                        and self._rms(pcm) >= VOX_RX_RMS):
+                    self._rx_active_until = time.monotonic() + VOX_RX_HANG
                 vol = self.rx_volume
                 if vol != 1.0 and pcm is not silence:
                     samples = array("h")

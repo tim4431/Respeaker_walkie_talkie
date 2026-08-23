@@ -1,56 +1,96 @@
 #!/usr/bin/env python3
-"""Walkie-talkie control center.
+"""Walkie group control center.
 
-Left sidebar: every walkie unit on the network (mDNS discovery + live status
-polled over the control protocol). Main panel: selected device's state, live
-waveforms while talking, and peer assignment ("pair A with B", or Auto).
+Top: one card per node (walkie units and this PC alike) with live status,
+mic waveform, mute/TX-mode/volume controls. Bottom: group chat editor -
+drag a node card into a group box; a node may be in several groups.
 
-Control packets (WT_FLAG_CTRL) are ignored by the firmware's peer adoption,
-so monitoring any number of devices never disturbs an ongoing audio link.
+Groups are a GUI-side structure (gui_settings.json). What each device
+actually stores (NVS, survives reboots, works with the GUI closed) is its
+resulting send-list: the union of everyone it shares a group with. The GUI
+keeps device send-lists reconciled with the group layout automatically.
 
     python walkie_gui.py
 """
 
+import json
 import math
 import socket
 import struct
 import threading
 import time
 import tkinter as tk
+import tkinter.simpledialog
 from array import array
 from collections import deque
+from pathlib import Path
 
 from walkie_pc import HDR, MAGIC, PORT, VERSION, WalkieClient
+
+SETTINGS_PATH = Path(__file__).with_name("gui_settings.json")
 
 FLAG_CTRL = 0x02
 CTRL_STATUS_REQ = 0x01
 CTRL_STATUS_RSP = 0x02
-CTRL_SET_PEER = 0x03
 CTRL_SET_VOL = 0x04
-STATUS = struct.Struct("<BBBBBbHI24s")   # wt_status_t (volume byte appended
-SET_PEER = struct.Struct("<BBHI")        # by newer firmware, parsed optionally)
+CTRL_SET_MODE = 0x05
+CTRL_SET_MUTE = 0x06
+CTRL_SET_GROUP = 0x07
+STATUS = struct.Struct("<BBBBBbHI24s")   # wt_status_t base (36 B); the
+MEMBER = struct.Struct("<IH")            # extension fields are optional
 
-BG = "#1e1e28"
-PANEL = "#28283a"
-SIDE = "#242433"
-SEL = "#34345a"
-FG = "#e8e8f0"
-DIM = "#8888a0"
-TX_COLOR = "#ffb454"
-RX_COLOR = "#54d68a"
+MAX_MEMBERS = 8
+
+# ---------------------------------------------------------------- theme
+
+BG      = "#eaedf4"
+CARD    = "#ffffff"
+CARD2   = "#f5f7fc"   # nested panels (group boxes)
+SEL     = "#dbe4ff"
+FG      = "#141a2a"
+DIM     = "#535b73"
+BORDER  = "#ccd4e3"
+ACCENT  = "#4263eb"
+TROUGH  = "#c7d0e2"
+BTN_BG  = "#e9edf6"
+BTN_ON  = "#4263eb"
+
+TX_COLOR = "#e8590c"
+RX_COLOR = "#099268"
 
 COLORS = {
-    "offline": "#606070",
-    "idle": "#4a90e0",
-    "linked": "#40d070",
-    "muted": "#c060e0",
+    "offline": "#9aa2b1",
+    "idle": "#339af0",
+    "linked": "#2f9e44",
+    "muted": "#ae3ec9",
 }
 
-WAVE_W = 430
-WAVE_H = 64
-BARS = 80
-BAR_WIDTH = 3
-DOT_H = 1.2
+FONT = "Segoe UI"
+
+
+def load_settings():
+    try:
+        return json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(cfg):
+    try:
+        SETTINGS_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def local_ip_toward(ip):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((ip, 1))
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
 
 
 # ---------------------------------------------------------------- monitor
@@ -70,6 +110,9 @@ class Monitor:
         threading.Thread(target=self._poll, daemon=True).start()
         threading.Thread(target=self._recv, daemon=True).start()
         threading.Thread(target=self._presence, daemon=True).start()
+
+    def stop(self):
+        self._stop.set()
 
     def _presence(self):
         """Discover devices from their 2 s presence broadcasts on :5004 -
@@ -98,9 +141,6 @@ class Monitor:
                 d.setdefault("name", addr[0])
                 d.setdefault("port", PORT)
         ps.close()
-
-    def stop(self):
-        self._stop.set()
 
     def _browse(self):
         from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
@@ -132,12 +172,10 @@ class Monitor:
         while not self._stop.is_set():
             with self.lock:
                 targets = [(ip, d.get("port", PORT)) for ip, d in self.devices.items()]
-                # devices that have answered before but went quiet: if the
-                # router blackholed this flow, a fresh source port fixes it
                 now = time.monotonic()
                 stale = [ip for ip, d in self.devices.items()
                          if d.get("last_rsp") and now - d["last_rsp"] > 5]
-            # never yank the socket while a call is riding this flow
+            # never yank the socket while audio/group traffic rides this flow
             if stale and now - last_rebind > 6 and self.active_client is None:
                 old = self.sock
                 self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -153,12 +191,46 @@ class Monitor:
                     self.sock.sendto(req, (ip, port))
                 except OSError:
                     pass
-            time.sleep(1.5)
+            time.sleep(0.8)
+
+    @staticmethod
+    def _parse_status(body):
+        (_, _, muted, linked, locked, rssi,
+         peer_port, peer_ip, host) = STATUS.unpack_from(body)
+        st = {
+            "muted": muted, "linked": linked, "locked": locked,
+            "rssi": rssi, "volume": None, "tx_mode": None,
+            "tx_active": 0, "rx_active": 0, "members": [], "mic_level": 0,
+            "vox_sens": None, "mic_gain": None,
+        }
+        off = STATUS.size
+        for i, n in enumerate(("volume", "tx_mode", "tx_active", "rx_active")):
+            if len(body) > off + i:
+                st[n] = body[off + i]
+        mc_off = off + 4
+        count = body[mc_off] if len(body) > mc_off else 0
+        p = mc_off + 1
+        for _ in range(count):
+            if len(body) >= p + MEMBER.size:
+                mip, mport = MEMBER.unpack_from(body, p)
+                st["members"].append(
+                    (socket.inet_ntoa(struct.pack("<I", mip)),
+                     socket.ntohs(mport)))
+            p += MEMBER.size
+        lvl_off = mc_off + 1 + MAX_MEMBERS * MEMBER.size
+        if len(body) > lvl_off:
+            st["mic_level"] = body[lvl_off]
+        if len(body) > lvl_off + 1:
+            st["vox_sens"] = body[lvl_off + 1]
+        if len(body) > lvl_off + 2:
+            st["mic_gain"] = body[lvl_off + 2]
+        host_s = host.split(b"\0")[0].decode(errors="replace")
+        return host_s, st
 
     def _recv(self):
         while not self._stop.is_set():
             try:
-                data, addr = self.sock.recvfrom(2048)
+                data, addr = self.sock.recvfrom(4096)
             except socket.timeout:
                 continue
             except OSError:
@@ -172,12 +244,12 @@ class Monitor:
             if magic != MAGIC or version != VERSION:
                 continue
             client = self.active_client
-            if flags & 0x01:  # audio riding the shared flow -> active call
-                if client and addr[0] == client.target[0]:
-                    client.handle_audio(seq, data[HDR.size:])
+            if flags & 0x01:  # audio (group traffic or a shared-flow call)
+                if client and client.accepts(addr[0]):
+                    client.handle_audio(seq, data[HDR.size:], src=addr)
                 continue
-            if not flags:  # keepalive: refresh the call's liveness
-                if client and addr[0] == client.target[0]:
+            if not flags:  # keepalive: refresh the sender's liveness
+                if client and client.accepts(addr[0]):
                     client.last_rx_time = time.monotonic()
                 continue
             if not flags & FLAG_CTRL or len(data) < HDR.size + STATUS.size:
@@ -185,49 +257,55 @@ class Monitor:
             body = data[HDR.size:]
             if body[0] != CTRL_STATUS_RSP:
                 continue
-            (_, _, muted, linked, locked, rssi,
-             peer_port, peer_ip, host) = STATUS.unpack_from(body)
-            volume = body[STATUS.size] if len(body) > STATUS.size else None
+            name, st = self._parse_status(body)
             with self.lock:
                 d = self.devices.setdefault(addr[0], {"port": addr[1]})
-                d["name"] = host.split(b"\0")[0].decode(errors="replace") or addr[0]
-                d["status"] = {
-                    "muted": muted, "linked": linked, "locked": locked,
-                    "rssi": rssi, "peer_ip": peer_ip, "peer_port": peer_port,
-                    "volume": volume,
-                }
+                d["name"] = name or addr[0]
+                d["status"] = st
                 d["last_rsp"] = time.monotonic()
 
     def snapshot(self):
         with self.lock:
             return {ip: dict(d) for ip, d in self.devices.items()}
 
-    def set_peer(self, dev_ip, dev_port, peer_ip_str, peer_port):
-        """peer_ip_str None => Auto (clear lock)."""
-        ip_n = 0 if not peer_ip_str else struct.unpack(
-            "<I", socket.inet_aton(peer_ip_str))[0]
-        body = SET_PEER.pack(CTRL_SET_PEER, 0,
-                             socket.htons(peer_port) if peer_ip_str else 0, ip_n)
+    # ---- control commands (each answered by a status we pick up in _recv)
+
+    def _ctrl(self, dev_ip, dev_port, body):
         pkt = HDR.pack(MAGIC, 0, FLAG_CTRL, VERSION) + body
         try:
             self.sock.sendto(pkt, (dev_ip, dev_port))
         except OSError:
             pass
 
-    def set_volume(self, dev_ip, dev_port, volume):
-        """Set the device's speaker volume (0-100)."""
-        vol = max(0, min(100, int(volume)))
-        pkt = (HDR.pack(MAGIC, 0, FLAG_CTRL, VERSION)
-               + struct.pack("<BB", CTRL_SET_VOL, vol))
-        try:
-            self.sock.sendto(pkt, (dev_ip, dev_port))
-        except OSError:
-            pass
+    def set_volume(self, ip, port, volume):
+        self._ctrl(ip, port, struct.pack("<BB", CTRL_SET_VOL,
+                                         max(0, min(100, int(volume)))))
+
+    def set_mode(self, ip, port, vox):
+        self._ctrl(ip, port, struct.pack("<BB", CTRL_SET_MODE, 1 if vox else 0))
+
+    def set_mute(self, ip, port, muted):
+        self._ctrl(ip, port, struct.pack("<BB", CTRL_SET_MUTE, 1 if muted else 0))
+
+    def set_sens(self, ip, port, sens):
+        self._ctrl(ip, port, struct.pack("<BB", CTRL_SET_SENS,
+                                         max(0, min(100, int(sens)))))
+
+    def set_gain(self, ip, port, gain):
+        self._ctrl(ip, port, struct.pack("<BB", CTRL_SET_GAIN,
+                                         max(0, min(200, int(gain)))))
+
+    def set_group(self, ip, port, members):
+        body = struct.pack("<BB", CTRL_SET_GROUP, len(members))
+        for mip, mport in members:
+            body += MEMBER.pack(struct.unpack("<I", socket.inet_aton(mip))[0],
+                                socket.htons(mport))
+        self._ctrl(ip, port, body)
 
 
 def state_of(dev):
     st = dev.get("status")
-    if not st or time.monotonic() - dev.get("last_rsp", 0) > 6:
+    if not st or time.monotonic() - dev.get("last_rsp", 0) > 4:
         return "offline"
     if st["muted"]:
         return "muted"
@@ -236,57 +314,123 @@ def state_of(dev):
     return "idle"
 
 
-def local_ip_toward(ip):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect((ip, 1))
-        return s.getsockname()[0]
-    except OSError:
-        return None
-    finally:
-        s.close()
+# ---------------------------------------------------------------- widgets
+
+def card(parent, bg=CARD):
+    return tk.Frame(parent, bg=bg, highlightbackground=BORDER,
+                    highlightthickness=1)
 
 
-# ---------------------------------------------------------------- waveform
+def flat_btn(parent, text, command, accent=False, small=False):
+    return tk.Button(parent, text=text, command=command,
+                     bg=BTN_ON if accent else BTN_BG,
+                     fg="#ffffff" if accent else FG,
+                     activebackground="#3b5bdb" if accent else "#dbe2f0",
+                     activeforeground="#ffffff" if accent else FG,
+                     disabledforeground="#a3aabf",
+                     relief="flat", bd=0, padx=8 if small else 12,
+                     pady=1 if small else 3,
+                     font=(FONT, 8 if small else 10))
 
-class WaveView:
-    def __init__(self, parent, label, color):
-        self.frame = tk.Frame(parent, bg=BG)
-        tk.Label(self.frame, text=label, fg=DIM, bg=BG, anchor="w",
-                 font=("Segoe UI", 9)).pack(fill="x")
-        self.canvas = tk.Canvas(self.frame, width=WAVE_W, height=WAVE_H,
-                                bg=PANEL, highlightthickness=0)
-        self.canvas.pack(fill="x")
-        self.levels = deque([0.0] * BARS, maxlen=BARS)
-        mid = WAVE_H / 2
-        step = WAVE_W / (BARS + 1)
-        self.bars = [self.canvas.create_line(
-            (i + 1) * step, mid - DOT_H, (i + 1) * step, mid + DOT_H,
-            fill=color, width=BAR_WIDTH, capstyle="round") for i in range(BARS)]
 
-    @staticmethod
-    def _level(pcm_bytes):
-        if not pcm_bytes:
-            return 0.0
-        samples = array("h", pcm_bytes)
-        acc = 0
-        n = 0
-        for i in range(0, len(samples), 4):
-            s = samples[i]
-            acc += s * s
-            n += 1
-        rms = math.sqrt(acc / max(n, 1)) / 32768.0
-        return min(1.0, math.sqrt(rms) * 1.8)
+class MiniWave:
+    """Small per-card level history."""
 
-    def update(self, pcm_bytes):
-        self.levels.append(self._level(pcm_bytes))
-        mid = WAVE_H / 2
-        step = WAVE_W / (BARS + 1)
-        span = mid - 5
+    BARS = 44
+
+    def __init__(self, parent, color, height=40):
+        self.h = height
+        self.canvas = tk.Canvas(parent, height=height, bg="#f4f6fb",
+                                highlightthickness=1,
+                                highlightbackground=BORDER)
+        self.levels = deque([0.0] * self.BARS, maxlen=self.BARS)
+        self.color = color
+        self.bars = []
+
+    def push(self, level):
+        self.levels.append(max(0.0, min(1.0, level)))
+        c = self.canvas
+        w = max(c.winfo_width(), 60)
+        mid = self.h / 2
+        step = w / (self.BARS + 1)
+        if len(self.bars) != self.BARS:
+            c.delete("all")
+            self.bars = [c.create_line(0, mid, 0, mid, fill=self.color,
+                                       width=3, capstyle="round")
+                         for _ in range(self.BARS)]
+        span = mid - 4
         for i, lv in enumerate(self.levels):
             x = (i + 1) * step
-            h = max(DOT_H, lv * span)
-            self.canvas.coords(self.bars[i], x, mid - h, x, mid + h)
+            hh = max(1.2, lv * span)
+            c.coords(self.bars[i], x, mid - hh, x, mid + hh)
+
+
+def pcm_level(pcm_bytes):
+    if not pcm_bytes:
+        return 0.0
+    samples = array("h", pcm_bytes)
+    acc = 0
+    n = 0
+    for i in range(0, len(samples), 4):
+        s = samples[i]
+        acc += s * s
+        n += 1
+    rms = math.sqrt(acc / max(n, 1)) / 32768.0
+    return min(1.0, math.sqrt(rms) * 1.8)
+
+
+class BarSlider:
+    """High-contrast 0-100 slider: filled bar + knob, click/drag to set."""
+
+    def __init__(self, parent, command=None, on_release=None,
+                 width=110, height=18, color=ACCENT, vmax=100):
+        self.canvas = tk.Canvas(parent, width=width, height=height,
+                                bg=CARD2, highlightthickness=0)
+        self.h = height
+        self.color = color
+        self.vmax = vmax
+        self.value = 0
+        self.command = command
+        self.on_release = on_release
+        self.canvas.bind("<Button-1>", self._press)
+        self.canvas.bind("<B1-Motion>", self._press)
+        self.canvas.bind("<ButtonRelease-1>", self._release)
+        self.canvas.bind("<Configure>", lambda e: self._draw())
+        self._draw()
+
+    def _press(self, e):
+        w = max(self.canvas.winfo_width(), 10)
+        v = round(max(0.0, min(1.0, e.x / w)) * self.vmax)
+        if v != self.value:
+            self.value = v
+            self._draw()
+            if self.command:
+                self.command(v)
+
+    def _release(self, _e):
+        if self.on_release:
+            self.on_release(self.value)
+
+    def set(self, v):
+        self.value = max(0, min(self.vmax, int(v)))
+        self._draw()
+
+    def get(self):
+        return self.value
+
+    def _draw(self):
+        c = self.canvas
+        c.delete("all")
+        w = max(c.winfo_width(), 10)
+        h = self.h
+        y0, y1 = 4, h - 4
+        c.create_rectangle(1, y0, w - 2, y1, fill="#d4dae8",
+                           outline="#aeb8cd")
+        x = int((w - 4) * self.value / self.vmax) + 2
+        if x > 2:
+            c.create_rectangle(1, y0, x, y1, fill=self.color, outline="")
+        c.create_rectangle(max(1, x - 3), 1, min(w - 2, x + 3), h - 1,
+                           fill="#2b3a55", outline="#ffffff")
 
 
 # ---------------------------------------------------------------- app
@@ -295,264 +439,829 @@ class App:
     def __init__(self, root):
         self.root = root
         self.monitor = Monitor()
-        self.client = None            # active WalkieClient, if talking
+        self.client = None          # direct 1:1 TCP call
         self.talk_ip = None
-        self.selected = None
-        self.rows = {}                # ip -> row widgets
+        self.group_client = None    # PC-as-node UDP group client
+        self.group_targets = []
+        self.settings = load_settings()
+        self.groups = self.settings.get("groups", [])  # [{name, members}]
+        self.tx_mode = self.settings.get("mode", "full")
+        self.pc_muted = False
+        self.cards = {}             # node id -> card widget dict
+        self.group_boxes = []       # [{frame, ...}] parallel to self.groups
+        self._groups_sig = None
+        self._last_desired_ips = set()
+        self._drag = None
+        self._tick_n = 0
+        self.new_group_btn = None
 
-        root.title("Walkie-Talkie")
+        root.title("Walkie Group")
         root.configure(bg=BG)
-        # fixed size: otherwise label text changes resize the whole window
-        root.geometry("665x495+120+120")
-        root.resizable(False, False)
-        root.attributes("-topmost", True)
-        root.after(1500, lambda: root.attributes("-topmost", False))
+        root.geometry("1040x760+80+40")
+        root.minsize(900, 640)
 
-        side = tk.Frame(root, bg=SIDE, width=185)
-        side.pack(side="left", fill="y")
-        side.pack_propagate(False)
-        tk.Label(side, text="DEVICES", fg=DIM, bg=SIDE,
-                 font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=10, pady=(10, 4))
-        self.dev_list = tk.Frame(side, bg=SIDE)
-        self.dev_list.pack(fill="both", expand=True)
-
-        self.main = tk.Frame(root, bg=BG)
-        self.main.pack(side="left", fill="both", expand=True)
-        self._build_main()
+        self._build_header()
+        self._build_cards_panel()
+        self._build_groups_panel()
         self.tick()
+        self.root.after(2500, self.import_groups_from_devices)
+        self.root.after(3000, lambda: self.reconcile(force=True))
 
-    # ------------------------------------------------ main panel widgets
+    # ------------------------------------------------ layout
 
-    def _build_main(self):
-        m = self.main
-        top = tk.Frame(m, bg=BG)
-        top.pack(fill="x", padx=14, pady=(12, 0))
-        self.title = tk.Label(top, text="select a device", fg=FG, bg=BG,
-                              font=("Segoe UI", 13, "bold"), anchor="w")
-        self.title.pack(side="left")
-        self.talk_btn = tk.Button(top, text="Talk", width=10, state="disabled",
-                                  command=self.toggle_talk, bg=PANEL, fg=FG,
-                                  activebackground="#3a3a55",
-                                  activeforeground=FG, relief="flat")
-        self.talk_btn.pack(side="right")
+    def _build_header(self):
+        hdr = tk.Frame(self.root, bg=CARD, highlightbackground=BORDER,
+                       highlightthickness=1)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="Walkie Group", fg=FG, bg=CARD,
+                 font=(FONT, 15, "bold")).pack(side="left", padx=16, pady=9)
+        flat_btn(hdr, "WiFi via USB...", self.usb_setup).pack(
+            side="right", padx=14, pady=8)
+        self.hdr_info = tk.Label(hdr, text="", fg=DIM, bg=CARD,
+                                 font=(FONT, 10))
+        self.hdr_info.pack(side="right", padx=10)
 
-        self.info = tk.Label(m, text="", fg=DIM, bg=BG, anchor="w",
-                             justify="left", font=("Consolas", 9))
-        self.info.pack(fill="x", padx=14, pady=(6, 0))
+    def _build_cards_panel(self):
+        panel = card(self.root)
+        panel.pack(fill="x", padx=12, pady=(12, 0))
+        top = tk.Frame(panel, bg=CARD)
+        top.pack(fill="x", padx=12, pady=(8, 0))
+        tk.Label(top, text="NODES", fg=DIM, bg=CARD,
+                 font=(FONT, 10, "bold")).pack(side="left")
+        tk.Label(top, text="drag a card into a group below",
+                 fg=DIM, bg=CARD, font=(FONT, 9)).pack(side="right")
+        self.cards_row = tk.Frame(panel, bg=CARD)
+        self.cards_row.pack(fill="x", padx=8, pady=8)
 
-        pair = tk.Frame(m, bg=BG)
-        pair.pack(fill="x", padx=14, pady=(8, 0))
-        tk.Label(pair, text="peer:", fg=DIM, bg=BG,
-                 font=("Segoe UI", 9)).pack(side="left")
-        self.peer_var = tk.StringVar(value="Auto")
-        self.peer_menu = tk.OptionMenu(pair, self.peer_var, "Auto")
-        self.peer_menu.configure(bg=PANEL, fg=FG, relief="flat",
-                                 highlightthickness=0, activebackground=SEL,
-                                 activeforeground=FG)
-        self.peer_menu.pack(side="left", padx=6)
-        tk.Button(pair, text="Apply", command=self.apply_peer, bg=PANEL, fg=FG,
-                  activebackground="#3a3a55", activeforeground=FG,
-                  relief="flat").pack(side="left")
+    def _build_groups_panel(self):
+        panel = card(self.root)
+        panel.pack(fill="both", expand=True, padx=12, pady=(12, 0))
+        top = tk.Frame(panel, bg=CARD)
+        top.pack(fill="x", padx=12, pady=(8, 0))
+        tk.Label(top, text="GROUPS", fg=DIM, bg=CARD,
+                 font=(FONT, 10, "bold")).pack(side="left")
+        self.grp_note = tk.Label(top, text="", fg=DIM, bg=CARD,
+                                 font=(FONT, 9))
+        self.grp_note.pack(side="right")
+        self.groups_row = tk.Frame(panel, bg=CARD)
+        self.groups_row.pack(fill="both", expand=True, padx=8, pady=8)
 
-        vol = tk.Frame(m, bg=BG)
-        vol.pack(fill="x", padx=14, pady=(8, 0))
-        slider_opts = dict(orient="horizontal", length=150, showvalue=False,
-                           bg=BG, fg=FG, troughcolor=PANEL,
-                           highlightthickness=0, sliderrelief="flat",
-                           activebackground=SEL)
-        tk.Label(vol, text="device spk", fg=DIM, bg=BG,
-                 font=("Segoe UI", 9)).pack(side="left")
-        self._dev_vol_guard = False   # True while set() mirrors device state
-        self._dev_vol_last_send = 0.0
-        self.dev_vol = tk.Scale(vol, from_=0, to=100,
-                                command=self._on_dev_vol, **slider_opts)
-        self.dev_vol.set(100)
-        self.dev_vol.pack(side="left", padx=(6, 0))
-        self.dev_vol.bind("<ButtonRelease-1>", self._on_dev_vol_release)
-        tk.Label(vol, text="PC out", fg=DIM, bg=BG,
-                 font=("Segoe UI", 9)).pack(side="left", padx=(14, 0))
-        self.pc_vol_gain = 1.0
-        self.pc_vol = tk.Scale(vol, from_=0, to=150,
-                               command=self._on_pc_vol, **slider_opts)
-        self.pc_vol.set(100)
-        self.pc_vol.pack(side="left", padx=(6, 0))
+    # ------------------------------------------------ node model
 
-        self.tx_wave = WaveView(m, "PC mic -> device (TX)", TX_COLOR)
-        self.rx_wave = WaveView(m, "device -> PC speakers (RX)", RX_COLOR)
-        self.tx_wave.frame.pack(fill="x", padx=14, pady=(10, 0))
-        self.rx_wave.frame.pack(fill="x", padx=14, pady=(8, 0))
-        tk.Label(m, text="tip: use headphones - the PC has no echo canceller",
-                 fg=DIM, bg=BG, font=("Segoe UI", 8)).pack(pady=(6, 8))
-
-    # ------------------------------------------------ sidebar
-
-    def _rebuild_sidebar(self, devs):
-        for ip in list(self.rows):
-            if ip not in devs:
-                self.rows.pop(ip)["frame"].destroy()
-        for ip, dev in sorted(devs.items()):
-            if ip not in self.rows:
-                f = tk.Frame(self.dev_list, bg=SIDE, cursor="hand2")
-                f.pack(fill="x")
-                dot = tk.Canvas(f, width=12, height=12, bg=SIDE,
-                                highlightthickness=0)
-                oid = dot.create_oval(2, 2, 10, 10, fill=COLORS["offline"],
-                                      outline="")
-                dot.pack(side="left", padx=(10, 4), pady=6)
-                lbl = tk.Label(f, text=ip, fg=FG, bg=SIDE, anchor="w",
-                               font=("Segoe UI", 10))
-                lbl.pack(side="left", fill="x", expand=True)
-                for w in (f, dot, lbl):
-                    w.bind("<Button-1>", lambda e, ip=ip: self.select(ip))
-                self.rows[ip] = {"frame": f, "dot": dot, "oid": oid, "lbl": lbl}
-            row = self.rows[ip]
-            row["lbl"].config(text=dev.get("name", ip))
-            row["dot"].itemconfig(row["oid"], fill=COLORS[self._eff_state(ip, dev)])
-            bgc = SEL if ip == self.selected else SIDE
-            row["frame"].config(bg=bgc)
-            row["lbl"].config(bg=bgc)
-            row["dot"].config(bg=bgc)
-
-    def select(self, ip):
-        self.selected = ip
-        self.talk_btn.config(state="normal")
-        st = self.monitor.snapshot().get(ip, {}).get("status")
-        if st and st.get("volume") is not None:
-            self._dev_vol_guard = True
-            self.dev_vol.set(st["volume"])
-            self._dev_vol_guard = False
-
-    # ------------------------------------------------ volume
-
-    def _send_dev_vol(self):
+    def pc_addr(self):
         devs = self.monitor.snapshot()
-        if self.selected in devs:
-            self.monitor.set_volume(self.selected,
-                                    devs[self.selected].get("port", PORT),
-                                    self.dev_vol.get())
+        any_ip = next(iter(devs), "8.8.8.8")
+        ip = local_ip_toward(any_ip) or "127.0.0.1"
+        return ip, self.monitor.sock.getsockname()[1]
 
-    def _on_dev_vol(self, _value):
-        if self._dev_vol_guard or not self.selected:
-            return
-        # throttle mid-drag updates; the release handler sends the final value
-        now = time.monotonic()
-        if now - self._dev_vol_last_send > 0.15:
-            self._dev_vol_last_send = now
-            self._send_dev_vol()
+    def active_pc_client(self):
+        return self.group_client or self.client
 
-    def _on_dev_vol_release(self, _event):
-        if self.selected:
-            self._send_dev_vol()
+    def nodes(self):
+        devs = self.monitor.snapshot()
+        c = self.active_pc_client()
+        pc_level = pcm_level(c.last_tx_pcm) if c else 0.0
+        out = [{
+            "id": "pc", "key": "pc", "name": "This PC", "is_pc": True,
+            "online": True, "tx": bool(c and c.tx_active),
+            "rx": bool(c and time.monotonic() - c.last_rx_time < 0.5),
+            "muted": self.pc_muted, "level": pc_level, "dev": None,
+            "state": "muted" if self.pc_muted else "idle",
+            "sub": "in group" if self.group_client else
+                   (f"calling {self.talk_ip}" if self.client else "ready"),
+        }]
+        for ip, dev in sorted(devs.items()):
+            st = dev.get("status") or {}
+            fresh = dev.get("last_rsp") and \
+                time.monotonic() - dev["last_rsp"] < 4
+            state = state_of(dev)
+            if self.client and ip == self.talk_ip and state == "offline":
+                state = "linked"
+            sub = (f"{st.get('rssi', '?')} dBm · "
+                   f"tx {'voice' if st.get('tx_mode') else 'always'}"
+                   if fresh else "offline")
+            out.append({
+                "id": ip, "key": dev.get("name", ip),
+                "name": dev.get("name", ip), "is_pc": False,
+                "online": bool(fresh), "tx": bool(fresh and st.get("tx_active")),
+                "rx": bool(fresh and st.get("rx_active")),
+                "muted": bool(st.get("muted")),
+                "level": (st.get("mic_level", 0) / 255.0) * 1.6
+                         if fresh else 0.0,
+                "dev": dev, "state": state, "sub": sub,
+            })
+        return out
 
-    def _on_pc_vol(self, value):
-        self.pc_vol_gain = int(value) / 100.0
+    # ------------------------------------------------ node cards
+
+    def _make_card(self, n):
+        f = card(self.cards_row, bg=CARD2)
+        f.configure(width=252)
+        hdrrow = tk.Frame(f, bg=CARD2, cursor="fleur")
+        hdrrow.pack(fill="x", padx=8, pady=(6, 0))
+        dot = tk.Canvas(hdrrow, width=12, height=12, bg=CARD2,
+                        highlightthickness=0)
+        oid = dot.create_oval(2, 2, 10, 10, fill=COLORS["offline"],
+                              outline="")
+        dot.pack(side="left", pady=2)
+        name = tk.Label(hdrrow, text=n["name"], fg=FG, bg=CARD2,
+                        font=(FONT, 11, "bold"), cursor="fleur")
+        name.pack(side="left", padx=6)
+        badge = tk.Label(hdrrow, text="", bg=CARD2, fg="#ffffff",
+                         font=(FONT, 8, "bold"), padx=5)
+        badge.pack(side="right")
+
+        wave = MiniWave(f, TX_COLOR if n["is_pc"] else RX_COLOR, height=38)
+        wave.canvas.configure(cursor="fleur")
+        wave.canvas.pack(in_=f, fill="x", padx=8, pady=(4, 0))
+
+        sub = tk.Label(f, text="", fg=DIM, bg=CARD2, anchor="w",
+                       font=(FONT, 9))
+        sub.pack(fill="x", padx=9)
+
+        btns = tk.Frame(f, bg=CARD2)
+        btns.pack(fill="x", padx=8, pady=(2, 0))
+        b_mute = flat_btn(btns, "Mute", lambda i=n["id"]: self.toggle_mute(i),
+                          small=True)
+        b_mute.pack(side="left")
+        b_mode = flat_btn(btns, "TX: always",
+                          lambda i=n["id"]: self.toggle_mode(i), small=True)
+        b_mode.pack(side="left", padx=4)
+        b_call = None
+        if not n["is_pc"]:
+            b_call = flat_btn(btns, "Call",
+                              lambda i=n["id"]: self.toggle_talk(i),
+                              small=True)
+            b_call.pack(side="left")
+
+        def bar_row(label, color, on_change, on_final, vmax=100):
+            row = tk.Frame(f, bg=CARD2)
+            row.pack(fill="x", padx=8, pady=(1, 2))
+            tk.Label(row, text=label, fg=DIM, bg=CARD2, width=4, anchor="w",
+                     font=(FONT, 9)).pack(side="left")
+            pct = tk.Label(row, text="", fg=FG, bg=CARD2, width=5,
+                           anchor="e", font=(FONT, 9, "bold"))
+            pct.pack(side="right")
+            bar = BarSlider(row, command=on_change, on_release=on_final,
+                            color=color, vmax=vmax)
+            bar.canvas.pack(side="left", fill="x", expand=True, padx=(4, 4))
+            return bar, pct
+
+        vol, vol_pct = bar_row(
+            "vol", ACCENT,
+            lambda v, i=n["id"]: self._on_card_vol(i, v, False),
+            lambda v, i=n["id"]: self._on_card_vol(i, v, True))
+        gain, gain_pct = bar_row(
+            "gain", TX_COLOR,
+            lambda v, i=n["id"]: self._on_card_gain(i, v, False),
+            lambda v, i=n["id"]: self._on_card_gain(i, v, True), vmax=200)
+        sens, sens_pct = bar_row(
+            "sens", RX_COLOR,
+            lambda v, i=n["id"]: self._on_card_sens(i, v, False),
+            lambda v, i=n["id"]: self._on_card_sens(i, v, True))
+        tk.Frame(f, bg=CARD2, height=4).pack()
+
+        for w in (hdrrow, name, wave.canvas):
+            w.bind("<ButtonPress-1>", lambda e, i=n["id"]: self._drag_start(e, i))
+            w.bind("<B1-Motion>", self._drag_move)
+            w.bind("<ButtonRelease-1>", self._drag_drop)
+
+        cardw = {"frame": f, "dot": dot, "oid": oid, "name": name,
+                 "badge": badge, "wave": wave, "sub": sub, "mute": b_mute,
+                 "mode": b_mode, "call": b_call,
+                 "vol": vol, "vol_pct": vol_pct, "vol_init": False,
+                 "gain": gain, "gain_pct": gain_pct, "gain_init": False,
+                 "sens": sens, "sens_pct": sens_pct, "sens_init": False,
+                 "last_vol_send": 0.0, "last_sens_send": 0.0,
+                 "last_gain_send": 0.0}
+        f.pack(side="left", padx=4, pady=2, fill="y")
+        return cardw
+
+    def _update_card(self, cw, n):
+        cw["dot"].itemconfig(cw["oid"], fill=COLORS[n["state"]])
+        cw["name"].config(text=n["name"])
+        cw["sub"].config(text=n["sub"])
+        if n["tx"]:
+            cw["badge"].config(text="SPEAKING", bg=TX_COLOR)
+        elif n["muted"]:
+            cw["badge"].config(text="MUTED", bg=COLORS["muted"])
+        elif n["rx"]:
+            cw["badge"].config(text="HEARING", bg=RX_COLOR)
+        else:
+            cw["badge"].config(text="", bg=CARD2)
+        cw["mute"].config(text="Unmute" if n["muted"] else "Mute")
+        if n["is_pc"]:
+            vox = self.tx_mode == "vox"
+        else:
+            st = (n["dev"] or {}).get("status") or {}
+            vox = bool(st.get("tx_mode"))
+        cw["mode"].config(text="TX: voice" if vox else "TX: always",
+                          bg=BTN_ON if vox else BTN_BG,
+                          fg="#ffffff" if vox else FG)
+        if cw["call"] is not None:
+            in_call = self.client and self.talk_ip == n["id"]
+            cw["call"].config(text="End" if in_call else "Call",
+                              bg=TX_COLOR if in_call else BTN_BG,
+                              fg="#ffffff" if in_call else FG,
+                              state="disabled" if (self.group_client and
+                                                   not in_call)
+                              else "normal")
+        # sliders reflect the node's stored values until the user touches them
+        st = (n["dev"] or {}).get("status") or {}
+        if n["is_pc"]:
+            vol_val = min(100, int(self.settings.get("pc_vol", 100)))
+            sens_val = int(self.settings.get("pc_sens", 75))
+            gain_val = int(self.settings.get("pc_gain", 100))
+        else:
+            vol_val = st.get("volume")
+            sens_val = st.get("vox_sens")
+            gain_val = st.get("mic_gain")
+        if vol_val is not None and not cw["vol_init"]:
+            cw["vol"].set(vol_val)
+            cw["vol_init"] = True
+        if sens_val is not None and not cw["sens_init"]:
+            cw["sens"].set(sens_val)
+            cw["sens_init"] = True
+        if gain_val is not None and not cw["gain_init"]:
+            cw["gain"].set(gain_val)
+            cw["gain_init"] = True
+        cw["vol_pct"].config(text=f"{cw['vol'].get()}%")
+        cw["gain_pct"].config(text=f"{cw['gain'].get()}%")
+        cw["sens_pct"].config(text=f"{cw['sens'].get()}")
+
+    def _refresh_cards(self, nodes):
+        ids = [n["id"] for n in nodes]
+        for nid in list(self.cards):
+            if nid not in ids:
+                self.cards.pop(nid)["frame"].destroy()
+        for n in nodes:
+            if n["id"] not in self.cards:
+                self.cards[n["id"]] = self._make_card(n)
+            self._update_card(self.cards[n["id"]], n)
+
+    # ---- card actions
+
+    def toggle_mute(self, nid):
+        if nid == "pc":
+            self.pc_muted = not self.pc_muted
+            for c in (self.client, self.group_client):
+                if c:
+                    c.muted = self.pc_muted
+        else:
+            dev = self.monitor.snapshot().get(nid)
+            if dev:
+                st = dev.get("status") or {}
+                self.monitor.set_mute(nid, dev.get("port", PORT),
+                                      not st.get("muted"))
+
+    def toggle_mode(self, nid):
+        if nid == "pc":
+            self.tx_mode = "vox" if self.tx_mode == "full" else "full"
+            for c in (self.client, self.group_client):
+                if c:
+                    c.mode = self.tx_mode
+            self.settings["mode"] = self.tx_mode
+            save_settings(self.settings)
+        else:
+            dev = self.monitor.snapshot().get(nid)
+            if dev:
+                st = dev.get("status") or {}
+                self.monitor.set_mode(nid, dev.get("port", PORT),
+                                      not st.get("tx_mode"))
+
+    def _on_card_vol(self, nid, value, final):
+        value = int(value)
+        cw = self.cards.get(nid)
+        if cw:
+            cw["vol_init"] = True   # user owns the slider now
+            cw["vol_pct"].config(text=f"{value}%")
+        if nid == "pc":
+            self.settings["pc_vol"] = value
+            save_settings(self.settings)
+            for c in (self.client, self.group_client):
+                if c:
+                    c.rx_volume = value / 100.0
+        else:
+            now = time.monotonic()
+            if cw and (final or now - cw["last_vol_send"] > 0.15):
+                cw["last_vol_send"] = now
+                dev = self.monitor.snapshot().get(nid)
+                if dev:
+                    self.monitor.set_volume(nid, dev.get("port", PORT),
+                                            value)
+
+    def _on_card_gain(self, nid, value, final):
+        value = int(value)
+        cw = self.cards.get(nid)
+        if cw:
+            cw["gain_init"] = True
+            cw["gain_pct"].config(text=f"{value}%")
+        if nid == "pc":
+            self.settings["pc_gain"] = value
+            save_settings(self.settings)
+            for c in (self.client, self.group_client):
+                if c:
+                    c.tx_gain = value / 100.0
+        else:
+            now = time.monotonic()
+            if cw and (final or now - cw["last_gain_send"] > 0.15):
+                cw["last_gain_send"] = now
+                dev = self.monitor.snapshot().get(nid)
+                if dev:
+                    self.monitor.set_gain(nid, dev.get("port", PORT), value)
+
+    def _on_card_sens(self, nid, value, final):
+        value = int(value)
+        cw = self.cards.get(nid)
+        if cw:
+            cw["sens_init"] = True
+            cw["sens_pct"].config(text=f"{value}")
+        if nid == "pc":
+            self.settings["pc_sens"] = value
+            save_settings(self.settings)
+            for c in (self.client, self.group_client):
+                if c:
+                    c.vox_sens = value
+        else:
+            now = time.monotonic()
+            if cw and (final or now - cw["last_sens_send"] > 0.15):
+                cw["last_sens_send"] = now
+                dev = self.monitor.snapshot().get(nid)
+                if dev:
+                    self.monitor.set_sens(nid, dev.get("port", PORT), value)
+
+    def toggle_talk(self, ip):
         if self.client:
-            self.client.rx_volume = self.pc_vol_gain
+            was = self.talk_ip
+            self.client.stop()
+            self.client = None
+            self.talk_ip = None
+            if was == ip:
+                return
+        if self.group_client:
+            return
+        devs = self.monitor.snapshot()
+        if ip not in devs:
+            return
+        port = devs[ip].get("port", PORT)
+        self.client = WalkieClient((ip, port))
+        self._apply_pc_client_prefs(self.client)
+        self.client.start()
+        self.talk_ip = ip
 
-    def _eff_state(self, ip, dev):
-        """During a call, the call itself is the truth for that device -
-        UDP status polls can be lost while the TCP audio is fine."""
-        c = self.client
-        if c and ip == self.talk_ip:
-            return "linked" if c.linked() else "idle"
-        return state_of(dev)
+    def _apply_pc_client_prefs(self, c):
+        c.rx_volume = min(100, int(self.settings.get("pc_vol", 100))) / 100.0
+        c.vox_sens = int(self.settings.get("pc_sens", 75))
+        c.tx_gain = int(self.settings.get("pc_gain", 100)) / 100.0
+        c.mode = self.tx_mode
+        c.muted = self.pc_muted
 
-    # ------------------------------------------------ actions
+    # ------------------------------------------------ drag and drop
 
-    def toggle_talk(self):
+    def _drag_start(self, event, nid):
+        self._drag = {"id": nid, "ghost": None, "x": event.x_root,
+                      "y": event.y_root}
+
+    def _drag_move(self, event):
+        d = self._drag
+        if not d:
+            return
+        if d["ghost"] is None:
+            if abs(event.x_root - d["x"]) + abs(event.y_root - d["y"]) < 8:
+                return
+            g = tk.Toplevel(self.root)
+            g.overrideredirect(True)
+            try:
+                g.attributes("-alpha", 0.85)
+            except tk.TclError:
+                pass
+            name = ("This PC" if d["id"] == "pc" else
+                    self.monitor.snapshot().get(d["id"], {}).get("name",
+                                                                 d["id"]))
+            tk.Label(g, text="  " + name + "  ", bg=ACCENT, fg="#ffffff",
+                     font=(FONT, 10, "bold"), padx=6, pady=3).pack()
+            d["ghost"] = g
+        d["ghost"].geometry(f"+{event.x_root + 12}+{event.y_root + 8}")
+
+    def _hit(self, widget, x, y):
+        try:
+            wx, wy = widget.winfo_rootx(), widget.winfo_rooty()
+            return (wx <= x <= wx + widget.winfo_width() and
+                    wy <= y <= wy + widget.winfo_height())
+        except tk.TclError:
+            return False
+
+    def _drag_drop(self, event):
+        d = self._drag
+        self._drag = None
+        if not d:
+            return
+        if d["ghost"] is None:
+            return  # plain click, no drag
+        d["ghost"].destroy()
+        nid = d["id"]
+        key = ("pc" if nid == "pc" else
+               self.monitor.snapshot().get(nid, {}).get("name", nid))
+        for i, box in enumerate(self.group_boxes):
+            if self._hit(box["frame"], event.x_root, event.y_root):
+                g = self.groups[i]
+                if key not in g["members"]:
+                    if len(g["members"]) >= MAX_MEMBERS:
+                        return
+                    g["members"].append(key)
+                    self.groups_changed()
+                return
+        if self.new_group_btn is not None and \
+                self._hit(self.new_group_btn, event.x_root, event.y_root):
+            self._add_group([key])
+
+    # ------------------------------------------------ groups panel
+
+    def _groups_signature(self, nodes):
+        online = {n["key"]: (n["online"], n["tx"]) for n in nodes}
+        return json.dumps(self.groups) + repr(sorted(online.items()))
+
+    def _rebuild_groups(self, nodes):
+        sig = self._groups_signature(nodes)
+        if sig == self._groups_sig:
+            return
+        self._groups_sig = sig
+        for w in self.groups_row.winfo_children():
+            w.destroy()
+        self.group_boxes = []
+        info = {n["key"]: n for n in nodes}
+        for gi, g in enumerate(self.groups):
+            box = card(self.groups_row, bg=CARD2)
+            box.pack(side="left", fill="y", padx=4, pady=2, ipadx=4)
+            head = tk.Frame(box, bg=CARD2)
+            head.pack(fill="x", padx=6, pady=(5, 2))
+            nm = tk.Label(head, text=g.get("name", f"Group {gi + 1}"),
+                          fg=FG, bg=CARD2, font=(FONT, 10, "bold"))
+            nm.pack(side="left")
+            nm.bind("<Double-Button-1>", lambda e, i=gi: self._rename(i))
+            tk.Button(head, text="✕", command=lambda i=gi: self._del_group(i),
+                      bg=CARD2, fg=DIM, activebackground=CARD2,
+                      activeforeground=FG, relief="flat", bd=0,
+                      font=(FONT, 9)).pack(side="right")
+            chips = tk.Frame(box, bg=CARD2)
+            chips.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+            if not g["members"]:
+                tk.Label(chips, text="drop nodes here", fg=DIM, bg=CARD2,
+                         font=(FONT, 9, "italic")).pack(padx=10, pady=10)
+            for key in g["members"]:
+                n = info.get(key)
+                talking = bool(n and n["tx"])
+                online = bool(n and n["online"])
+                chip = tk.Frame(chips,
+                                bg=TX_COLOR if talking else
+                                ("#e2e8f5" if online else "#eceff5"))
+                chip.pack(fill="x", pady=2)
+                tk.Label(chip, text=(n["name"] if n else key),
+                         bg=chip["bg"],
+                         fg="#ffffff" if talking else
+                         (FG if online else DIM),
+                         font=(FONT, 9,
+                               "bold" if talking else "normal"),
+                         padx=6, pady=2).pack(side="left")
+                tk.Button(chip, text="✕",
+                          command=lambda i=gi, k=key: self._chip_remove(i, k),
+                          bg=chip["bg"], fg="#ffffff" if talking else DIM,
+                          activebackground=chip["bg"], activeforeground=FG,
+                          relief="flat", bd=0,
+                          font=(FONT, 8)).pack(side="right", padx=(6, 2))
+            self.group_boxes.append({"frame": box})
+        self.new_group_btn = tk.Label(self.groups_row,
+                                      text="+\nnew group\n(drop here)",
+                                      fg=DIM, bg=CARD,
+                                      highlightbackground=BORDER,
+                                      highlightthickness=1,
+                                      font=(FONT, 9), justify="center",
+                                      padx=16, pady=14)
+        self.new_group_btn.pack(side="left", padx=6, pady=2, fill="y")
+        self.new_group_btn.bind("<Button-1>", lambda e: self._add_group([]))
+
+    def _add_group(self, members):
+        self.groups.append({"name": f"Group {len(self.groups) + 1}",
+                            "members": list(members)})
+        self.groups_changed()
+
+    def _del_group(self, i):
+        del self.groups[i]
+        self.groups_changed()
+
+    def _chip_remove(self, gi, key):
+        g = self.groups[gi]
+        if key in g["members"]:
+            g["members"].remove(key)
+        self.groups_changed()
+
+    def _rename(self, i):
+        name = tkinter.simpledialog.askstring(
+            "Rename group", "Group name:",
+            initialvalue=self.groups[i].get("name", ""), parent=self.root)
+        if name:
+            self.groups[i]["name"] = name.strip()[:24]
+            self.groups_changed()
+
+    def groups_changed(self):
+        self.settings["groups"] = self.groups
+        save_settings(self.settings)
+        self._groups_sig = None
+        self.reconcile(force=True)
+
+    # ------------------------------------------------ external-group import
+
+    def import_groups_from_devices(self):
+        """If the GUI has no groups, reconstruct them from the member lists
+        the devices report (configured elsewhere / a previous session).
+        Union lists can't encode overlapping groups, so each connected
+        component becomes one group."""
+        if self.groups:
+            return
+        devs = self.monitor.snapshot()
+        pc_ip, _ = self.pc_addr()
+        addr2key = {(ip, d.get("port", PORT)): d.get("name", ip)
+                    for ip, d in devs.items()}
+        parent = {}
+
+        def find(x):
+            parent.setdefault(x, x)
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            parent[find(a)] = find(b)
+
+        for ip, d in devs.items():
+            st = d.get("status") or {}
+            k = d.get("name", ip)
+            for m in st.get("members") or []:
+                mk = addr2key.get(tuple(m))
+                if mk is None and m[0] == pc_ip:
+                    mk = "pc"  # our addr (any port - ports change per run)
+                if mk is not None:
+                    union(k, mk)
+        comps = {}
+        for k in parent:
+            comps.setdefault(find(k), []).append(k)
+        groups = [sorted(v) for v in comps.values() if len(v) >= 2]
+        if groups:
+            self.groups = [{"name": f"Group {i + 1}", "members": g}
+                           for i, g in enumerate(groups)]
+            self.grp_note.config(text="imported existing group(s) from "
+                                      "device member lists")
+            self.settings["groups"] = self.groups
+            save_settings(self.settings)
+            self._groups_sig = None
+
+    # ------------------------------------------------ routing reconcile
+
+    def compute_desired(self):
+        """GUI groups -> per-device send-lists + PC targets (unions)."""
+        devs = self.monitor.snapshot()
+        name2dev = {d.get("name", ip): (ip, d.get("port", PORT))
+                    for ip, d in devs.items()}
+        pc = self.pc_addr()
+        desired = {}      # device ip -> set((ip, port))
+        pc_targets = set()
+        for g in self.groups:
+            mem = [m for m in g["members"]]
+            for m in mem:
+                others = [o for o in mem if o != m]
+                if m == "pc":
+                    for o in others:
+                        if o in name2dev:
+                            pc_targets.add(name2dev[o])
+                elif m in name2dev:
+                    s = desired.setdefault(name2dev[m][0], set())
+                    for o in others:
+                        if o == "pc":
+                            s.add(pc)
+                        elif o in name2dev:
+                            s.add(name2dev[o])
+        return devs, desired, pc_targets
+
+    def reconcile(self, force=False):
+        """Push the group layout into device NVS member lists (diff-based)."""
+        devs, desired, pc_targets = self.compute_desired()
+        clipped = False
+        for ip, want in desired.items():
+            if len(want) > MAX_MEMBERS:
+                want = set(sorted(want)[:MAX_MEMBERS])
+                clipped = True
+            dev = devs.get(ip)
+            st = dev.get("status") if dev else None
+            fresh = dev and dev.get("last_rsp") and \
+                time.monotonic() - dev["last_rsp"] < 4
+            if not st or not fresh:
+                continue
+            if set(st.get("members") or []) != want or force:
+                self.monitor.set_group(ip, dev.get("port", PORT),
+                                       sorted(want))
+        # devices that dropped out of all groups: clear once
+        for ip in self._last_desired_ips - set(desired):
+            dev = devs.get(ip)
+            if dev:
+                self.monitor.set_group(ip, dev.get("port", PORT), [])
+        self._last_desired_ips = set(desired)
+        self.grp_note.config(
+            text=("some device lists clipped to 8 members!" if clipped else
+                  "membership is pushed to devices and persists on them"))
+        # PC side
+        targets = sorted(pc_targets)
+        if targets:
+            if (not self.group_client or
+                    self.group_targets != targets):
+                self._start_group_client(targets)
+        else:
+            self._stop_group_client()
+
+    def _start_group_client(self, targets):
         if self.client:
             self.client.stop()
             self.client = None
             self.talk_ip = None
-            self.talk_btn.config(text="Talk")
-            return
-        devs = self.monitor.snapshot()
-        if self.selected not in devs:
-            return
-        port = devs[self.selected].get("port", PORT)
-        # audio rides TCP (immune to the router's UDP flow lottery);
-        # UDP v2 with its own socket is the fallback for old firmware
-        self.client = WalkieClient((self.selected, port))
-        self.client.rx_volume = self.pc_vol_gain
-        self.client.start()
-        self.talk_ip = self.selected
-        self.talk_btn.config(text="Stop")
+        self._stop_group_client()
+        gc = WalkieClient(sock=self.monitor.sock, external_rx=True,
+                          use_tcp=False, targets=targets)
+        self._apply_pc_client_prefs(gc)
+        self.group_client = gc
+        self.group_targets = targets
+        self.monitor.active_client = gc
+        gc.start()
 
-    def apply_peer(self):
-        devs = self.monitor.snapshot()
-        if self.selected not in devs:
+    def _stop_group_client(self):
+        if self.group_client:
+            self.monitor.active_client = None
+            self.group_client.stop()
+            self.group_client = None
+            self.group_targets = []
+
+    def leave_group_on_exit(self):
+        """Best effort: remove this PC from every device's member list.
+        Device-to-device routing is left untouched - it keeps working
+        with the GUI closed."""
+        if not self.group_client:
             return
-        sel_port = devs[self.selected].get("port", PORT)
-        choice = self.peer_var.get()
-        if choice == "Auto":
-            self.monitor.set_peer(self.selected, sel_port, None, 0)
+        pc = self.pc_addr()
+        for ip, dev in self.monitor.snapshot().items():
+            st = dev.get("status") or {}
+            members = [m for m in (st.get("members") or []) if m != pc]
+            if len(members) != len(st.get("members") or []):
+                self.monitor.set_group(ip, dev.get("port", PORT), members)
+
+    # ------------------------------------------------ USB WiFi setup
+
+    def usb_setup(self):
+        try:
+            import serial  # noqa: F401
+            from serial.tools import list_ports
+        except ImportError:
+            self._usb_error("pyserial is not installed.\n"
+                            "Run: pip install pyserial")
             return
-        for ip, dev in devs.items():
-            if dev.get("name") == choice and ip != self.selected:
-                # pair both directions so the two units talk to each other
-                self.monitor.set_peer(self.selected, sel_port, ip,
-                                      dev.get("port", PORT))
-                self.monitor.set_peer(ip, dev.get("port", PORT),
-                                      self.selected, sel_port)
+
+        win = tk.Toplevel(self.root)
+        win.title("WiFi via USB")
+        win.configure(bg=CARD)
+        win.resizable(False, False)
+        win.transient(self.root)
+
+        tk.Label(win, text="First-time setup: flash the stock firmware, plug\n"
+                           "in the XIAO's USB-C, then store WiFi here.\n"
+                           "Credentials persist on the device (NVS).",
+                 fg=DIM, bg=CARD, justify="left",
+                 font=(FONT, 10)).grid(row=0, column=0, columnspan=2,
+                                       sticky="w", padx=14, pady=(12, 8))
+
+        def walkie_ports():
+            ports = [p.device for p in list_ports.comports()
+                     if p.vid == 0x303A]
+            return ports or [p.device for p in list_ports.comports()]
+
+        entries = {}
+        port_var = tk.StringVar()
+        ports = walkie_ports()
+        port_var.set(ports[0] if ports else "")
+        rows = [("port", tk.OptionMenu(win, port_var, *(ports or [""])))]
+        for label in ("SSID", "password"):
+            e = tk.Entry(win, bg="#f1f4fa", fg=FG, insertbackground=FG,
+                         relief="flat", width=26, font=(FONT, 10),
+                         show="*" if label == "password" else "")
+            entries[label] = e
+            rows.append((label, e))
+        for i, (label, widget) in enumerate(rows, start=1):
+            tk.Label(win, text=label, fg=DIM, bg=CARD,
+                     font=(FONT, 10)).grid(row=i, column=0, sticky="e",
+                                           padx=(14, 6), pady=3)
+            if isinstance(widget, tk.OptionMenu):
+                widget.configure(bg=BTN_BG, fg=FG, relief="flat",
+                                 highlightthickness=0, activebackground=SEL,
+                                 activeforeground=FG, font=(FONT, 10))
+            widget.grid(row=i, column=1, sticky="we", padx=(0, 14), pady=3)
+
+        status = tk.Label(win, text="", fg=DIM, bg=CARD, justify="left",
+                          wraplength=280, font=(FONT, 10))
+        status.grid(row=5, column=0, columnspan=2, sticky="w",
+                    padx=14, pady=(6, 2))
+
+        def set_status(text):
+            self.root.after(0, lambda: status.config(text=text))
+
+        def worker(port, ssid, pwd):
+            import serial
+            try:
+                s = serial.Serial()
+                s.port = port
+                s.baudrate = 115200
+                s.timeout = 0.5
+                s.dtr = False
+                s.rts = False
+                s.open()
+            except OSError as e:
+                set_status(f"cannot open {port}: {e}")
                 return
+            try:
+                set_status("port open - waiting for the device...")
+                time.sleep(3.0)
+                s.reset_input_buffer()
+                s.write(f"wifi {ssid} {pwd}\n".encode())
+                deadline = time.monotonic() + 8
+                buf = b""
+                while time.monotonic() < deadline:
+                    buf += s.read(256)
+                    if b"WTCFG OK" in buf:
+                        set_status("saved - device is rebooting onto the "
+                                   "new network")
+                        return
+                    if b"WTCFG ERR" in buf:
+                        line = [l for l in buf.splitlines()
+                                if b"WTCFG ERR" in l][-1]
+                        set_status(line.decode(errors="replace"))
+                        return
+                set_status("no reply - is this the walkie's XIAO port, "
+                           "with current firmware?")
+            except OSError as e:
+                set_status(f"serial error: {e}")
+            finally:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+
+        def apply():
+            ssid = entries["SSID"].get().strip()
+            pwd = entries["password"].get()
+            if not port_var.get():
+                set_status("no COM port found")
+                return
+            if not ssid or " " in ssid:
+                set_status("SSID must be non-empty, without spaces")
+                return
+            if not 8 <= len(pwd) <= 64:
+                set_status("password must be 8-64 characters")
+                return
+            set_status("connecting...")
+            threading.Thread(target=worker,
+                             args=(port_var.get(), ssid, pwd),
+                             daemon=True).start()
+
+        tk.Button(win, text="Apply", command=apply, bg=BTN_ON, fg="#ffffff",
+                  activebackground="#3b5bdb", activeforeground="#ffffff",
+                  relief="flat", bd=0, width=12,
+                  font=(FONT, 10)).grid(row=6, column=1, sticky="e",
+                                        padx=(0, 14), pady=(4, 12))
+
+    def _usb_error(self, msg):
+        win = tk.Toplevel(self.root)
+        win.title("WiFi via USB")
+        win.configure(bg=CARD)
+        tk.Label(win, text=msg, fg=FG, bg=CARD, justify="left",
+                 font=(FONT, 10)).pack(padx=16, pady=16)
 
     # ------------------------------------------------ periodic refresh
 
-    def _peer_label(self, devs, st):
-        if not st or not st["peer_ip"]:
-            return "-"
-        ip = socket.inet_ntoa(struct.pack("<I", st["peer_ip"]))
-        if ip in devs:
-            return devs[ip].get("name", ip)
-        if self.client and ip == local_ip_toward(self.selected or "8.8.8.8"):
-            return "this PC"
-        return ip
-
     def tick(self):
-        # waveforms on a fixed 20 fps clock so their timebase never shifts
-        self._tick_n = getattr(self, "_tick_n", 0) + 1
-        c = self.client
-        if c:
-            self.tx_wave.update(c.last_tx_pcm if not c.muted else b"")
-            self.rx_wave.update(c.last_rx_pcm)
-        else:
-            self.tx_wave.update(b"")
-            self.rx_wave.update(b"")
+        self._tick_n += 1
+        nodes = self.nodes()
+        by_id = {n["id"]: n for n in nodes}
 
-        # sidebar/status/menu at a gentler 2.5 Hz
-        if self._tick_n % 8 == 1:
-            devs = self.monitor.snapshot()
-            self._rebuild_sidebar(devs)
+        # 20 Hz: per-card waveforms
+        for nid, cw in self.cards.items():
+            n = by_id.get(nid)
+            if n:
+                cw["wave"].push(n["level"])
 
-            menu = self.peer_menu["menu"]
-            menu.delete(0, "end")
-            for opt in ["Auto"] + [d.get("name", ip)
-                                   for ip, d in sorted(devs.items())
-                                   if ip != self.selected]:
-                menu.add_command(label=opt,
-                                 command=lambda v=opt: self.peer_var.set(v))
-
-            if self.selected and self.selected in devs:
-                dev = devs[self.selected]
-                st = dev.get("status")
-                state = self._eff_state(self.selected, dev)
-                self.title.config(
-                    text=f"{dev.get('name', self.selected)}  ({state})")
-                extra = "   [talking via TCP]" if (c and self.talk_ip ==
-                                                   self.selected) else ""
-                if st:
-                    self.info.config(text=(
-                        f"ip {self.selected}   rssi {st['rssi']} dBm   "
-                        f"peer {self._peer_label(devs, st)}"
-                        f"{'  [manual]' if st['locked'] else '  [auto]'}   "
-                        f"muted {'yes' if st['muted'] else 'no'}"
-                        f"{'   vol ' + str(st['volume']) if st.get('volume') is not None else ''}"
-                        f"{extra}"))
-                else:
-                    self.info.config(
-                        text=f"ip {self.selected}   (no status yet){extra}")
-            elif self.selected:
-                self.title.config(text=self.selected)
+        if self._tick_n % 8 == 0:  # 2.5 Hz: cards, groups, header
+            self._refresh_cards(nodes)
+            self._rebuild_groups(nodes)
+            grouped = sum(1 for g in self.groups for _ in g["members"])
+            self.hdr_info.config(
+                text=f"{len(nodes)} node(s) · {len(self.groups)} group(s)")
+        if self._tick_n % 80 == 0:  # every 4 s: reconcile device routing
+            self.reconcile()
 
         self.root.after(50, self.tick)
 
@@ -564,8 +1273,14 @@ def main():
     try:
         root.mainloop()
     finally:
+        try:
+            app.leave_group_on_exit()
+        except Exception:
+            pass
         if app.client:
             app.client.stop()
+        if app.group_client:
+            app.group_client.stop()
         app.monitor.stop()
     print("window closed.")
 

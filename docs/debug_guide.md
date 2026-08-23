@@ -15,16 +15,37 @@ Audio: Opus 48 kHz mono, 20 ms frames (960 samples), VOIP mode, wideband cap,
 DTX **off**. PC↔device audio runs over **TCP port 5010** (`[u16 len][opus]`
 stream, len 0 = heartbeat; device sends an identity banner frame starting with
 ASCII `WTKI` on accept — clients must not decode it as audio). Device↔device
-audio uses UDP protocol v2 on **port 5004** (see `main/protocol.h`: 8-byte
-header + batched `[u16 len][opus]` frames). While a TCP client is connected,
-UDP audio is NOT inserted into the jitter buffer (the two seq spaces are
-unrelated; interleaving them garbles playback) — TCP wins. Control (status
-query, manual peer assignment, speaker volume `WT_CTRL_SET_VOL` 0–100,
-persisted in NVS) is UDP on 5004 with `WT_FLAG_CTRL`; control packets never
-affect peer adoption; every ctrl request is answered with `wt_status_t`,
-whose final byte is the current volume (older parsers may ignore it). The
-device broadcasts an 8-byte presence packet to `:5004` every 2 s (discovery +
-AP keepalive).
+and group audio use UDP protocol v2 on **port 5004** (see `main/protocol.h`:
+8-byte header + batched `[u16 len][opus]` frames). While a TCP client is
+connected, UDP audio is NOT inserted into the jitter buffer (the two seq
+spaces are unrelated; interleaving them garbles playback) — TCP wins.
+
+**Group chat**: every node (walkie units and the PC alike) can hold a
+persisted member list (`WT_CTRL_SET_GROUP`: u8 count + count × {u32 ip,
+u16 port}, network order; count 0 leaves; stored in NVS). A node with
+members sends its audio/keepalives to all of them (`net_send_all`).
+Playback is one-speaker-at-a-time: a UDP source owns the jitter buffer
+until it has been silent for 400 ms (`WT_SPK_LOCK_US`); other members'
+frames are dropped meanwhile. The PC joins as a plain UDP node: the GUI
+registers the monitor socket's addr in each device's member list and runs
+a `WalkieClient(targets=[...], use_tcp=False)` on the shared socket.
+
+Control on UDP 5004 with `WT_FLAG_CTRL`: `SET_VOL` (0x04, volume 0–100,
+NVS), `SET_MODE` (0x05, 0 = always transmit, 1 = VOX/voice-activated, NVS),
+`SET_MUTE` (0x06, not persisted), `SET_GROUP` (0x07), `SET_SENS` (0x08, mic
+sensitivity 0–100, NVS; VOX TX threshold = `1000 + (100 - sens) * 190` in
+peak16 units), `SET_GAIN` (0x09, mic gain 0–200 %, NVS; saturating digital
+gain applied to captured samples before level/VOX/encode), plus status/peer
+as before. Control never affects peer
+adoption. Every ctrl request is answered with `wt_status_t`, which appends
+optional fields after hostname: volume, tx_mode, tx_active, rx_active,
+member_count, members[8], mic_level (frame peak >> 7), vox_sens, mic_gain —
+parse by length. VOX timing lives in `app_config.h` (`WT_VOX_*`). The device
+broadcasts an 8-byte presence packet to `:5004` every 2 s (discovery + AP
+keepalive). GUI group semantics: the GUI stores the group structure
+(multi-group) in `gui_settings.json`, pushes each device's union send-list,
+re-asserts it every 4 s for devices it manages, and imports groups from
+device member lists at startup when it has none of its own.
 
 ## Hardware connections (two different USB-C ports!)
 
@@ -80,7 +101,25 @@ powershell -ExecutionPolicy Bypass -File tools\flash_all.ps1 -XmosOnly
 
 ## Debugging
 
-### Serial console (COM port, 115200)
+### USB config console (COM port, 115200)
+
+The firmware runs a line-based config console on the XIAO's USB serial port
+(same COM port as the logs). Commands: `info` (identity), `wifi <ssid>
+<password>` (save WiFi credentials to NVS and reboot; NVS credentials
+override the ones baked into the build), `reboot`. Replies are single lines
+prefixed `WTCFG` and may interleave with log output — match per line. The
+GUI's "WiFi via USB..." button wraps this. Opening the port may reboot the
+device.
+
+Persistence: WiFi credentials (NVS after `wifi`, else compiled-in), speaker
+volume (NVS), and a manual peer pairing (NVS) all survive reboots; mute
+always boots off. The GUI stores PC volume and TX mode in
+`pc_client/gui_settings.json` (gitignored). The PC client's TX modes:
+`full` (always transmit) and `vox` (transmit only while the PC mic hears
+speech and the far end is quiet — the echo fix for open PC speakers, since
+only the XMOS side has AEC).
+
+### Serial log console (COM port, 115200)
 
 - **CRITICAL GOTCHA**: the USB-Serial-JTAG console delivers *stale buffered
   logs* — lines can be minutes old, with mid-line fragments and timestamp

@@ -1,5 +1,6 @@
 sounddevice
 zeroconf
+pyserial
 # PyPI's PyOgg release is too old for OpusEncoder/OpusDecoder; the dev
 # version bundles the needed opus DLLs on Windows.
 PyOgg @ git+https://github.com/TeamPyOgg/PyOgg

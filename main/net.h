@@ -33,6 +33,16 @@ void net_set_peer_manual(uint32_t ip, uint16_t port);
 struct wt_status;
 void net_fill_status(void *status, bool muted);
 
+/* Group membership (WT_CTRL_SET_GROUP): a persisted list of nodes this
+ * unit sends its audio to. entries in network order; count 0 leaves. */
+struct wt_member;
+void net_set_group(const void *entries, int count);
+int  net_group_size(void);
+
+/* Send to every group member, or to the adopted/manual peer if no group
+ * is configured. */
+void net_send_all(const void *buf, size_t len);
+
 const char *net_hostname(void);
 
 /* Broadcast a tiny presence packet on the walkie port (AP keepalive +
