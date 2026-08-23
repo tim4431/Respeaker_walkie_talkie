@@ -15,8 +15,10 @@ keeps device send-lists reconciled with the group layout automatically.
 
 import json
 import math
+import re
 import socket
 import struct
+import subprocess
 import threading
 import time
 import tkinter as tk
@@ -24,6 +26,9 @@ import tkinter.simpledialog
 from array import array
 from collections import deque
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+FLASH_SCRIPT = REPO_ROOT / "tools" / "flash_all.ps1"
 
 from walkie_pc import (HDR, MAGIC, PORT, VERSION, WalkieClient, vox_rms_of)
 
@@ -478,6 +483,515 @@ class BarSlider:
                            fill="#2b3a55", outline="#ffffff")
 
 
+# ---------------------------------------------------------------- setup
+
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+# A walkie's XMOS in I2S mode is a *pure DFU-class* device: a device-level
+# node (no "&MI_") whose CompatibleIds contain Class_FE. A ReSpeaker running
+# USB-audio firmware (e.g. a PC microphone) is a composite device whose
+# parent node also lacks "&MI_", so the Class_FE check is what tells them
+# apart - same rule tools/flash_all.ps1 uses. REV_xxxx gives the firmware
+# revision; 0110 is the 48 kHz I2S build this project needs.
+XMOS_QUERY = (
+    "Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | "
+    "Where-Object { $_.InstanceId -match 'VID_2886&PID_0019' } | "
+    "ForEach-Object { $p = Get-PnpDeviceProperty -InstanceId $_.InstanceId "
+    "-KeyName DEVPKEY_Device_HardwareIds,DEVPKEY_Device_CompatibleIds "
+    "-ErrorAction SilentlyContinue; "
+    "\"$($_.InstanceId)`t$(($p | ForEach-Object { $_.Data }) -join ';')\" }"
+)
+XMOS_TARGET_REV = 0x0110
+
+
+def probe_usb():
+    """What is plugged in right now: XIAO COM port, XMOS DFU state, and
+    whether a USB-audio ReSpeaker (the PC-mic unit) is present - dfu-util
+    must never run while one is connected."""
+    out = {"xiao_port": None, "xmos": False, "xmos_rev": None,
+           "usb_audio": False, "error": None}
+    try:
+        from serial.tools import list_ports
+        for p in list_ports.comports():
+            if p.vid == 0x303A:
+                out["xiao_port"] = p.device
+                break
+    except ImportError:
+        out["error"] = "pyserial not installed"
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", XMOS_QUERY],
+                           capture_output=True, text=True, timeout=25,
+                           creationflags=NO_WINDOW)
+        for line in r.stdout.splitlines():
+            if "VID_2886&PID_0019" not in line:
+                continue
+            inst, _, props = line.partition("\t")
+            if "&MI_" in inst:
+                out["usb_audio"] = True   # composite = USB-audio firmware
+                continue
+            if "Class_fe" not in props.lower():
+                continue                  # composite parent, not a DFU device
+            out["xmos"] = True
+            m = re.search(r"REV_([0-9A-Fa-f]{4})", props)
+            if m:
+                out["xmos_rev"] = int(m.group(1), 16)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return out
+
+
+class SetupWizard:
+    """Guided first-time setup: detect -> flash -> WiFi -> verify."""
+
+    STEPS = ("1 · Connect", "2 · Flash", "3 · WiFi", "4 · Done")
+
+    def __init__(self, app, start=0):
+        self.app = app
+        self.step = start
+        self.proc = None
+        self.usb = {}
+        self.win = win = tk.Toplevel(app.root)
+        win.title("Set up a walkie device")
+        win.configure(bg=CARD)
+        win.geometry("620x520")
+        win.transient(app.root)
+        win.protocol("WM_DELETE_WINDOW", self.close)
+
+        head = tk.Frame(win, bg=CARD)
+        head.pack(fill="x", padx=16, pady=(14, 6))
+        self.crumbs = []
+        for i, name in enumerate(self.STEPS):
+            lbl = tk.Label(head, text=name, bg=CARD, font=(FONT, 10),
+                           padx=8, pady=3, cursor="hand2")
+            lbl.pack(side="left", padx=(0, 4))
+            lbl.bind("<Button-1>", lambda e, i=i: self.goto(i))
+            self.crumbs.append(lbl)
+
+        self.body = tk.Frame(win, bg=CARD)
+        self.body.pack(fill="both", expand=True, padx=16, pady=4)
+
+        foot = tk.Frame(win, bg=CARD)
+        foot.pack(fill="x", padx=16, pady=(4, 14))
+        self.status = tk.Label(foot, text="", bg=CARD, fg=DIM, anchor="w",
+                               justify="left", wraplength=380,
+                               font=(FONT, 9))
+        self.status.pack(side="left", fill="x", expand=True)
+        self.next_btn = flat_btn(foot, "Next", self.next_step, accent=True)
+        self.next_btn.pack(side="right")
+        self.back_btn = flat_btn(foot, "Back",
+                                 lambda: self.goto(self.step - 1))
+        self.back_btn.pack(side="right", padx=(0, 6))
+
+        self.refresh_usb(async_=True)
+        self.render()
+
+    # ---- lifecycle
+
+    def close(self):
+        if self.proc and self.proc.poll() is None:
+            self.set_status("A flash is still running - it will keep going "
+                            "in the background.")
+        self.app.wizard = None
+        self.win.destroy()
+
+    def _ui(self, fn):
+        """Run fn on the Tk thread. Worker threads outlive the window (a
+        flash keeps going after Close), and a destroyed interpreter raises
+        RuntimeError as well as TclError - both mean 'nothing to update'."""
+        try:
+            self.win.after(0, fn)
+        except (tk.TclError, RuntimeError):
+            pass
+
+    def set_status(self, text):
+        self._ui(lambda: self.status.config(text=text))
+
+    def goto(self, i):
+        self.step = max(0, min(len(self.STEPS) - 1, i))
+        self.render()
+
+    def next_step(self):
+        if self.step >= len(self.STEPS) - 1:
+            self.close()
+        else:
+            self.goto(self.step + 1)
+
+    def refresh_usb(self, async_=False):
+        def work():
+            info = probe_usb()
+            self.usb = info
+            self._ui(self._usb_ready)
+        if async_:
+            threading.Thread(target=work, daemon=True).start()
+        else:
+            work()
+
+    def _usb_ready(self):
+        if self.step in (0, 1, 2):
+            self.render()
+
+    # ---- rendering
+
+    def render(self):
+        for i, lbl in enumerate(self.crumbs):
+            active = i == self.step
+            lbl.config(bg=BTN_ON if active else BTN_BG,
+                       fg="#ffffff" if active else DIM,
+                       font=(FONT, 10, "bold" if active else "normal"))
+        for w in self.body.winfo_children():
+            w.destroy()
+        self.back_btn.config(state="normal" if self.step else "disabled")
+        self.next_btn.config(text="Close" if self.step == len(self.STEPS) - 1
+                             else "Next")
+        [self._step_connect, self._step_flash, self._step_wifi,
+         self._step_done][self.step]()
+
+    def _title(self, text, sub=""):
+        tk.Label(self.body, text=text, bg=CARD, fg=FG, anchor="w",
+                 font=(FONT, 13, "bold")).pack(fill="x")
+        if sub:
+            tk.Label(self.body, text=sub, bg=CARD, fg=DIM, anchor="w",
+                     justify="left", wraplength=560,
+                     font=(FONT, 10)).pack(fill="x", pady=(2, 8))
+
+    def _row(self, parent, ok, text, warn=False):
+        f = tk.Frame(parent, bg=CARD)
+        f.pack(fill="x", pady=2)
+        mark = "✓" if ok else ("!" if warn else "·")
+        col = COLORS["linked"] if ok else (TX_COLOR if warn else DIM)
+        tk.Label(f, text=mark, bg=CARD, fg=col, width=2,
+                 font=(FONT, 11, "bold")).pack(side="left")
+        tk.Label(f, text=text, bg=CARD, fg=FG if ok or warn else DIM,
+                 anchor="w", justify="left", wraplength=520,
+                 font=(FONT, 10)).pack(side="left", fill="x", expand=True)
+
+    # ---- step 1: connect
+
+    def _step_connect(self):
+        self._title(
+            "Connect the device",
+            "The kit has two USB-C ports and they do different jobs.\n"
+            "• The XIAO module's port: ESP32 flashing, serial console, WiFi "
+            "setup.\n"
+            "• The ReSpeaker board's own port: XMOS audio firmware (DFU) "
+            "only.\n"
+            "Plugging in both at once is fine.")
+        u = self.usb
+        box = card(self.body, bg=CARD2)
+        box.pack(fill="x", pady=(4, 8))
+        inner = tk.Frame(box, bg=CARD2)
+        inner.pack(fill="x", padx=10, pady=8)
+        tk.Label(inner, text="detected", bg=CARD2, fg=DIM, anchor="w",
+                 font=(FONT, 9, "bold")).pack(fill="x", pady=(0, 4))
+        self._detect_rows(inner)
+        flat_btn(self.body, "Re-scan USB",
+                 lambda: self.refresh_usb(async_=True)).pack(anchor="w")
+        if not u:
+            self.set_status("scanning USB…")
+        elif u.get("usb_audio"):
+            self.set_status("A ReSpeaker in USB-audio mode is connected. "
+                            "Unplug it before flashing the XMOS.")
+        elif u.get("xiao_port"):
+            self.set_status("XIAO found - continue to flashing.")
+        else:
+            self.set_status("Plug in the XIAO's USB-C port, then Re-scan.")
+
+    def _detect_rows(self, parent):
+        u = self.usb
+        if not u:
+            self._row(parent, False, "scanning…")
+            return
+        port = u.get("xiao_port")
+        self._row(parent, bool(port),
+                  f"XIAO ESP32-S3 on {port}" if port else
+                  "XIAO ESP32-S3 not found (plug in the XIAO's USB-C)")
+        rev = u.get("xmos_rev")
+        if u.get("xmos"):
+            ok = rev == XMOS_TARGET_REV
+            detail = f", firmware rev {rev:04x}" if rev is not None else ""
+            self._row(parent, ok, f"ReSpeaker XMOS in DFU mode{detail}",
+                      warn=not ok)
+            if not ok:
+                self._row(parent, False,
+                          "needs the 48 kHz I2S build (rev 0110) - step 2 "
+                          "will flash it", warn=True)
+        else:
+            self._row(parent, False,
+                      "ReSpeaker XMOS not detected (only needed if its audio "
+                      "firmware is not installed yet)")
+        if u.get("usb_audio"):
+            self._row(parent, False,
+                      "DANGER: a ReSpeaker in USB-audio mode is connected "
+                      "(a PC microphone?). Unplug it before XMOS flashing - "
+                      "the flash script refuses to run otherwise.", warn=True)
+        if u.get("error"):
+            self._row(parent, False, u["error"], warn=True)
+
+    # ---- step 2: flash
+
+    def _step_flash(self):
+        self._title(
+            "Flash the firmware",
+            "Runs tools/flash_all.ps1. The XMOS step is skipped automatically "
+            "when its firmware is already correct. A full ESP32 build can "
+            "take a few minutes the first time.")
+        btns = tk.Frame(self.body, bg=CARD)
+        btns.pack(fill="x", pady=(0, 6))
+        self.b_both = flat_btn(btns, "Flash both", lambda: self.run_flash([]),
+                               accent=True)
+        self.b_both.pack(side="left")
+        self.b_esp = flat_btn(btns, "ESP32 only",
+                              lambda: self.run_flash(["-EspOnly"]))
+        self.b_esp.pack(side="left", padx=6)
+        self.b_xmos = flat_btn(btns, "XMOS only",
+                               lambda: self.run_flash(["-XmosOnly"]))
+        self.b_xmos.pack(side="left")
+        self.b_stop = flat_btn(btns, "Stop", self.stop_flash)
+        self.b_stop.pack(side="right")
+        self.b_stop.config(state="disabled")
+
+        wrap = tk.Frame(self.body, bg=CARD)
+        wrap.pack(fill="both", expand=True)
+        self.log = tk.Text(wrap, height=12, bg="#f7f8fc", fg=FG,
+                           relief="flat", wrap="word", font=("Consolas", 9),
+                           highlightthickness=1, highlightbackground=BORDER)
+        sb = tk.Scrollbar(wrap, command=self.log.yview)
+        self.log.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.log.pack(side="left", fill="both", expand=True)
+        self.log.insert("end", "Ready.\n" if FLASH_SCRIPT.exists() else
+                        f"flash script not found at {FLASH_SCRIPT}\n")
+        self.log.config(state="disabled")
+        if not FLASH_SCRIPT.exists():
+            for b in (self.b_both, self.b_esp, self.b_xmos):
+                b.config(state="disabled")
+        self.set_status("Zadig may open on the first XMOS flash per PC: "
+                        "select ReSpeaker Lite, then Install Driver.")
+
+    def _log(self, text):
+        def write():
+            try:
+                self.log.config(state="normal")
+                self.log.insert("end", text)
+                self.log.see("end")
+                self.log.config(state="disabled")
+            except tk.TclError:
+                pass    # the log pane belongs to a step that is gone
+        self._ui(write)
+
+    def run_flash(self, extra):
+        if self.proc and self.proc.poll() is None:
+            return
+        if "-EspOnly" not in extra and self.usb.get("usb_audio"):
+            self.set_status("Refusing: unplug the USB-audio ReSpeaker first, "
+                            "or use ESP32 only.")
+            return
+        cmd = ["powershell", "-ExecutionPolicy", "Bypass", "-File",
+               str(FLASH_SCRIPT)] + extra
+        port = self.usb.get("xiao_port")
+        if port and "-XmosOnly" not in extra:
+            cmd += ["-Port", port]
+        self._log("\n$ " + " ".join(cmd) + "\n")
+        for b in (self.b_both, self.b_esp, self.b_xmos):
+            b.config(state="disabled")
+        self.b_stop.config(state="normal")
+        self.set_status("flashing…")
+
+        def work():
+            try:
+                self.proc = subprocess.Popen(
+                    cmd, cwd=str(REPO_ROOT), stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT, text=True, bufsize=1,
+                    encoding="utf-8", errors="replace",
+                    creationflags=NO_WINDOW)
+            except OSError as e:
+                self._log(f"failed to start: {e}\n")
+                self.set_status("could not start PowerShell")
+                self._flash_done(None)
+                return
+            for line in self.proc.stdout:
+                self._log(line)
+            code = self.proc.wait()
+            self._flash_done(code)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _flash_done(self, code):
+        def finish():
+            try:
+                for b in (self.b_both, self.b_esp, self.b_xmos):
+                    b.config(state="normal")
+                self.b_stop.config(state="disabled")
+            except tk.TclError:
+                return
+            if code == 0:
+                self.set_status("Flash finished. Continue to WiFi setup.")
+            elif code is not None:
+                self.set_status(f"Flash exited with code {code} - check the "
+                                f"log above.")
+            self.refresh_usb(async_=True)
+        self._ui(finish)
+
+    def stop_flash(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            self._log("\n[stopped by user]\n")
+
+    # ---- step 3: wifi
+
+    def _step_wifi(self):
+        self._title(
+            "Give it WiFi",
+            "Credentials are stored on the device itself (NVS) and override "
+            "anything compiled into the firmware, so a unit can be moved to "
+            "another network without reflashing. Applying reboots the device.")
+        form = tk.Frame(self.body, bg=CARD)
+        form.pack(fill="x", pady=(2, 8))
+        try:
+            from serial.tools import list_ports
+            ports = [p.device for p in list_ports.comports() if p.vid == 0x303A]
+            if not ports:
+                ports = [p.device for p in list_ports.comports()]
+        except ImportError:
+            ports = []
+            self._row(self.body, False,
+                      "pyserial is not installed: pip install pyserial",
+                      warn=True)
+        self.port_var = tk.StringVar(value=self.usb.get("xiao_port")
+                                     or (ports[0] if ports else ""))
+        rows = [("port", tk.OptionMenu(form, self.port_var, *(ports or [""])))]
+        self.wifi_entries = {}
+        for label in ("SSID", "password"):
+            e = tk.Entry(form, bg="#f1f4fa", fg=FG, insertbackground=FG,
+                         relief="flat", width=28, font=(FONT, 10),
+                         show="*" if label == "password" else "")
+            self.wifi_entries[label] = e
+            rows.append((label, e))
+        for i, (label, widget) in enumerate(rows):
+            tk.Label(form, text=label, bg=CARD, fg=DIM, font=(FONT, 10)
+                     ).grid(row=i, column=0, sticky="e", padx=(0, 8), pady=3)
+            if isinstance(widget, tk.OptionMenu):
+                widget.configure(bg=BTN_BG, fg=FG, relief="flat",
+                                 highlightthickness=0, activebackground=SEL,
+                                 activeforeground=FG, font=(FONT, 10))
+            widget.grid(row=i, column=1, sticky="w", pady=3)
+        flat_btn(self.body, "Store WiFi on the device", self.apply_wifi,
+                 accent=True).pack(anchor="w")
+        tk.Label(self.body,
+                 text="SSIDs containing spaces are not supported over this "
+                      "path; the password must be 8-64 characters.",
+                 bg=CARD, fg=DIM, anchor="w", justify="left",
+                 wraplength=560, font=(FONT, 9)).pack(fill="x", pady=(8, 0))
+        self.set_status("Plug in the XIAO's USB-C, then store your network.")
+
+    def apply_wifi(self):
+        ssid = self.wifi_entries["SSID"].get().strip()
+        pwd = self.wifi_entries["password"].get()
+        port = self.port_var.get()
+        if not port:
+            self.set_status("no COM port found")
+            return
+        if not ssid or " " in ssid:
+            self.set_status("SSID must be non-empty and contain no spaces")
+            return
+        if not 8 <= len(pwd) <= 64:
+            self.set_status("password must be 8-64 characters")
+            return
+        self.set_status("connecting to the device…")
+        threading.Thread(target=self._wifi_worker, args=(port, ssid, pwd),
+                         daemon=True).start()
+
+    def _wifi_worker(self, port, ssid, pwd):
+        try:
+            import serial
+        except ImportError:
+            self.set_status("pyserial is not installed: pip install pyserial")
+            return
+        try:
+            s = serial.Serial()
+            s.port = port
+            s.baudrate = 115200
+            s.timeout = 0.5
+            s.dtr = False       # avoid yanking the reset lines
+            s.rts = False
+            s.open()
+        except OSError as e:
+            self.set_status(f"cannot open {port}: {e}")
+            return
+        try:
+            self.set_status("port open - waiting for the device…")
+            time.sleep(3.0)     # opening the port can reboot it
+            s.reset_input_buffer()
+            s.write(f"wifi {ssid} {pwd}\n".encode())
+            deadline = time.monotonic() + 8
+            buf = b""
+            while time.monotonic() < deadline:
+                buf += s.read(256)
+                if b"WTCFG OK" in buf:
+                    self.set_status("Saved. The device is rebooting onto "
+                                    "your network - continue to step 4.")
+                    return
+                if b"WTCFG ERR" in buf:
+                    line = [l for l in buf.splitlines()
+                            if b"WTCFG ERR" in l][-1]
+                    self.set_status(line.decode(errors="replace"))
+                    return
+            self.set_status("No reply. Is this the walkie's XIAO port, "
+                            "running current firmware?")
+        except OSError as e:
+            self.set_status(f"serial error: {e}")
+        finally:
+            try:
+                s.close()
+            except OSError:
+                pass
+
+    # ---- step 4: verify
+
+    def _step_done(self):
+        self._title(
+            "Check it joined",
+            "After a reboot the device connects to WiFi (LED orange), then "
+            "announces itself. It should appear here within ~15 seconds.")
+        self.found_box = tk.Frame(self.body, bg=CARD)
+        self.found_box.pack(fill="x", pady=(4, 8))
+        tk.Label(self.body,
+                 text="Next: drag the new node into a group on the main "
+                      "window to start talking. Volume, mic gain, TX mode "
+                      "and group membership are stored on the device itself.",
+                 bg=CARD, fg=DIM, anchor="w", justify="left",
+                 wraplength=560, font=(FONT, 10)).pack(fill="x")
+        self._poll_found()
+
+    def _poll_found(self):
+        if self.step != 3:
+            return
+        try:
+            for w in self.found_box.winfo_children():
+                w.destroy()
+        except tk.TclError:
+            return
+        devs = self.app.monitor.snapshot()
+        live = [(ip, d) for ip, d in sorted(devs.items())
+                if d.get("last_rsp") and
+                time.monotonic() - d["last_rsp"] < 6]
+        if live:
+            for ip, d in live:
+                st = d.get("status") or {}
+                self._row(self.found_box, True,
+                          f"{d.get('name', ip)}  ({ip})   "
+                          f"rssi {st.get('rssi', '?')} dBm")
+            self.set_status(f"{len(live)} device(s) online.")
+        else:
+            self._row(self.found_box, False, "no device on the network yet…")
+            self.set_status("Waiting - if the LED stays orange the "
+                            "credentials were wrong; redo step 3.")
+        try:
+            self.win.after(2000, self._poll_found)
+        except (tk.TclError, RuntimeError):
+            pass
+
+
 # ---------------------------------------------------------------- app
 
 class App:
@@ -499,6 +1013,7 @@ class App:
         self._drag = None
         self._tick_n = 0
         self.new_group_btn = None
+        self.wizard = None
 
         root.title("Walkie Group")
         root.configure(bg=BG)
@@ -520,8 +1035,10 @@ class App:
         hdr.pack(fill="x")
         tk.Label(hdr, text="Walkie Group", fg=FG, bg=CARD,
                  font=(FONT, 15, "bold")).pack(side="left", padx=16, pady=9)
-        flat_btn(hdr, "WiFi via USB...", self.usb_setup).pack(
-            side="right", padx=14, pady=8)
+        flat_btn(hdr, "Set up new device...", self.setup_wizard,
+                 accent=True).pack(side="right", padx=(6, 14), pady=8)
+        flat_btn(hdr, "WiFi via USB...",
+                 lambda: self.setup_wizard(step=2)).pack(side="right", pady=8)
         self.hdr_info = tk.Label(hdr, text="", fg=DIM, bg=CARD,
                                  font=(FONT, 10))
         self.hdr_info.pack(side="right", padx=10)
@@ -1240,134 +1757,19 @@ class App:
             if len(members) != len(st.get("members") or []):
                 self.monitor.set_group(ip, dev.get("port", PORT), members)
 
-    # ------------------------------------------------ USB WiFi setup
+    # ------------------------------------------------ setup wizard
 
-    def usb_setup(self):
-        try:
-            import serial  # noqa: F401
-            from serial.tools import list_ports
-        except ImportError:
-            self._usb_error("pyserial is not installed.\n"
-                            "Run: pip install pyserial")
-            return
-
-        win = tk.Toplevel(self.root)
-        win.title("WiFi via USB")
-        win.configure(bg=CARD)
-        win.resizable(False, False)
-        win.transient(self.root)
-
-        tk.Label(win, text="First-time setup: flash the stock firmware, plug\n"
-                           "in the XIAO's USB-C, then store WiFi here.\n"
-                           "Credentials persist on the device (NVS).",
-                 fg=DIM, bg=CARD, justify="left",
-                 font=(FONT, 10)).grid(row=0, column=0, columnspan=2,
-                                       sticky="w", padx=14, pady=(12, 8))
-
-        def walkie_ports():
-            ports = [p.device for p in list_ports.comports()
-                     if p.vid == 0x303A]
-            return ports or [p.device for p in list_ports.comports()]
-
-        entries = {}
-        port_var = tk.StringVar()
-        ports = walkie_ports()
-        port_var.set(ports[0] if ports else "")
-        rows = [("port", tk.OptionMenu(win, port_var, *(ports or [""])))]
-        for label in ("SSID", "password"):
-            e = tk.Entry(win, bg="#f1f4fa", fg=FG, insertbackground=FG,
-                         relief="flat", width=26, font=(FONT, 10),
-                         show="*" if label == "password" else "")
-            entries[label] = e
-            rows.append((label, e))
-        for i, (label, widget) in enumerate(rows, start=1):
-            tk.Label(win, text=label, fg=DIM, bg=CARD,
-                     font=(FONT, 10)).grid(row=i, column=0, sticky="e",
-                                           padx=(14, 6), pady=3)
-            if isinstance(widget, tk.OptionMenu):
-                widget.configure(bg=BTN_BG, fg=FG, relief="flat",
-                                 highlightthickness=0, activebackground=SEL,
-                                 activeforeground=FG, font=(FONT, 10))
-            widget.grid(row=i, column=1, sticky="we", padx=(0, 14), pady=3)
-
-        status = tk.Label(win, text="", fg=DIM, bg=CARD, justify="left",
-                          wraplength=280, font=(FONT, 10))
-        status.grid(row=5, column=0, columnspan=2, sticky="w",
-                    padx=14, pady=(6, 2))
-
-        def set_status(text):
-            self.root.after(0, lambda: status.config(text=text))
-
-        def worker(port, ssid, pwd):
-            import serial
+    def setup_wizard(self, step=0):
+        """Guided flash + provisioning for a new unit (see SetupWizard)."""
+        if self.wizard is not None:
             try:
-                s = serial.Serial()
-                s.port = port
-                s.baudrate = 115200
-                s.timeout = 0.5
-                s.dtr = False
-                s.rts = False
-                s.open()
-            except OSError as e:
-                set_status(f"cannot open {port}: {e}")
+                self.wizard.win.deiconify()
+                self.wizard.win.lift()
+                self.wizard.goto(step)
                 return
-            try:
-                set_status("port open - waiting for the device...")
-                time.sleep(3.0)
-                s.reset_input_buffer()
-                s.write(f"wifi {ssid} {pwd}\n".encode())
-                deadline = time.monotonic() + 8
-                buf = b""
-                while time.monotonic() < deadline:
-                    buf += s.read(256)
-                    if b"WTCFG OK" in buf:
-                        set_status("saved - device is rebooting onto the "
-                                   "new network")
-                        return
-                    if b"WTCFG ERR" in buf:
-                        line = [l for l in buf.splitlines()
-                                if b"WTCFG ERR" in l][-1]
-                        set_status(line.decode(errors="replace"))
-                        return
-                set_status("no reply - is this the walkie's XIAO port, "
-                           "with current firmware?")
-            except OSError as e:
-                set_status(f"serial error: {e}")
-            finally:
-                try:
-                    s.close()
-                except OSError:
-                    pass
-
-        def apply():
-            ssid = entries["SSID"].get().strip()
-            pwd = entries["password"].get()
-            if not port_var.get():
-                set_status("no COM port found")
-                return
-            if not ssid or " " in ssid:
-                set_status("SSID must be non-empty, without spaces")
-                return
-            if not 8 <= len(pwd) <= 64:
-                set_status("password must be 8-64 characters")
-                return
-            set_status("connecting...")
-            threading.Thread(target=worker,
-                             args=(port_var.get(), ssid, pwd),
-                             daemon=True).start()
-
-        tk.Button(win, text="Apply", command=apply, bg=BTN_ON, fg="#ffffff",
-                  activebackground="#3b5bdb", activeforeground="#ffffff",
-                  relief="flat", bd=0, width=12,
-                  font=(FONT, 10)).grid(row=6, column=1, sticky="e",
-                                        padx=(0, 14), pady=(4, 12))
-
-    def _usb_error(self, msg):
-        win = tk.Toplevel(self.root)
-        win.title("WiFi via USB")
-        win.configure(bg=CARD)
-        tk.Label(win, text=msg, fg=FG, bg=CARD, justify="left",
-                 font=(FONT, 10)).pack(padx=16, pady=16)
+            except tk.TclError:
+                self.wizard = None
+        self.wizard = SetupWizard(self, start=step)
 
     # ------------------------------------------------ periodic refresh
 

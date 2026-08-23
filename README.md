@@ -26,8 +26,9 @@ survive reboots.
   HEARING / MUTED badges, and a broadcast graph per group.
 - **Tune each node remotely**: speaker volume, mic gain, voice-activation
   gate, mute, and always-on vs voice-activated transmission.
-- **Provision a fresh unit over USB** — no WiFi credentials baked into the
-  firmware image.
+- **Set up a new unit from the GUI** — a wizard detects the hardware, flashes
+  both processors with live log output, and provisions WiFi over USB. No
+  credentials baked into the firmware image.
 
 ---
 
@@ -54,53 +55,59 @@ Seeed documentation:
 
 ## Quick start
 
-### 1. Flash a unit
-
-Requires [ESP-IDF v5.4](https://docs.espressif.com/projects/esp-idf/en/v5.4/esp32s3/get-started/).
-One command handles both processors:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File tools\flash_all.ps1
-```
-
-- **XMOS XU316** — plug in the *ReSpeaker board's* USB-C. The script reads the
-  USB DFU revision and flashes the 48 kHz I2S firmware only if needed. On the
-  first run per PC it launches Zadig for the one-time WinUSB driver install
-  (select *ReSpeaker Lite* → *Install Driver*), then continues.
-- **ESP32-S3** — plug in the *XIAO's* USB-C. The script finds the Espressif
-  COM port and runs `idf.py flash`.
-
-Useful flags: `-EspOnly`, `-XmosOnly`, `-Port COMx`, `-Monitor`.
-
-> ⚠️ If you own a second ReSpeaker used as a USB microphone, unplug it before
-> XMOS flashing. The script refuses to run when it detects one.
-
-### 2. Install the PC client
+### 1. Install the PC client
 
 ```powershell
 cd pc_client
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
-```
-
-### 3. Give the unit WiFi (no reflash needed)
-
-Credentials are **not** baked in at flash time. With the XIAO's USB-C plugged
-in, start the GUI and click **WiFi via USB…**:
-
-```powershell
 .venv\Scripts\python walkie_gui.py
 ```
 
-<img src="docs/images/gui-wifi-usb.png" alt="WiFi provisioning over USB" width="330">
+### 2. Run the setup wizard
 
-Pick the COM port, enter SSID and password, and **Apply**. The device stores
-them in NVS and reboots onto your network. Repeat per unit — each identifies
-itself by a MAC-derived hostname like `walkie-f6dd60`.
+Click **Set up new device…** in the header. The wizard walks a brand-new unit
+from bare board to a node on your network, and it detects what is actually
+plugged in as you go.
 
-*Alternative:* copy `wifi.conf.example` → `wifi.conf` at the repo root and the
-flash script will bake those credentials in as a fallback. Anything stored
-over USB takes priority.
+<img src="docs/images/gui-setup-wizard.png" alt="Setup wizard, step 1" width="520">
+
+**Step 1 · Connect** — explains the two USB-C ports and shows what it found:
+the XIAO's COM port, whether the ReSpeaker's XMOS is in DFU mode and which
+firmware revision it reports, and — importantly — whether a ReSpeaker in
+**USB-audio mode** (a PC microphone) is attached.
+
+**Step 2 · Flash** — runs `tools/flash_all.ps1` with its output streamed live
+into the window. Choose *Flash both*, *ESP32 only*, or *XMOS only*; **Stop**
+cancels. The XMOS step is skipped automatically when its firmware is already
+the 48 kHz I2S build (rev `0110`). Requires
+[ESP-IDF v5.4](https://docs.espressif.com/projects/esp-idf/en/v5.4/esp32s3/get-started/);
+the first ESP32 build takes a few minutes. On the first XMOS flash per PC,
+Zadig opens for the one-time WinUSB driver install (select *ReSpeaker Lite* →
+*Install Driver*).
+
+> ⚠️ If you own a second ReSpeaker used as a USB microphone, unplug it before
+> XMOS flashing. Both the wizard and the flash script refuse to run
+> `dfu-util` while one is connected, so the wrong device cannot be targeted.
+> *ESP32 only* stays available, since it never invokes `dfu-util`.
+
+**Step 3 · WiFi** — credentials are **not** baked into the firmware image.
+Pick the COM port, enter SSID and password, and store them on the device.
+
+<img src="docs/images/gui-wifi-usb.png" alt="WiFi provisioning over USB" width="520">
+
+They go into the device's NVS, **override anything compiled in**, and survive
+reflashing — so a unit can be moved to another network without rebuilding.
+The device reboots onto your network.
+
+**Step 4 · Done** — watches for the unit to appear on the network and lists
+what is online. Each unit identifies itself by a MAC-derived hostname like
+`walkie-f6dd60`. Repeat for each device, then drag the new node into a group.
+
+*Command line alternative:* `powershell -ExecutionPolicy Bypass -File
+tools\flash_all.ps1` (flags: `-EspOnly`, `-XmosOnly`, `-Port COMx`,
+`-Monitor`). Copying `wifi.conf.example` → `wifi.conf` at the repo root bakes
+credentials in as a fallback; anything stored over USB takes priority.
 
 ---
 

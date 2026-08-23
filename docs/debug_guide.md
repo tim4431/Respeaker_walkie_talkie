@@ -84,6 +84,11 @@ device. Firmware revision = the `REV_xxxx` in HardwareIds (0x0110 = correct
 
 ## Flashing
 
+The GUI wraps all of this in **Set up new device…** (detect → flash → WiFi →
+verify), streaming the script's output into the window. It probes USB itself
+and refuses XMOS flashing while a USB-audio ReSpeaker is attached. For
+scripted/CI use, drive the script directly:
+
 One command does everything:
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\flash_all.ps1          # both processors

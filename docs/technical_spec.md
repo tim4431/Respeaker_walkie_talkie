@@ -280,6 +280,17 @@ Line-based, on the XIAO's USB serial port (same COM port as the logs,
 115200). Replies are single lines prefixed `WTCFG` and may interleave with
 log output, so match per line.
 
+The GUI's setup wizard (**Set up new device…**) drives this console for
+provisioning. It also shells out to `tools/flash_all.ps1` with the output
+streamed into the window, and probes USB directly: `pyserial` for the XIAO
+(VID `0x303A`), and a PowerShell `Get-PnpDevice` query for the XMOS. A
+walkie's XMOS in I2S mode is a *pure DFU-class* device — a device node
+without `&MI_` whose CompatibleIds contain `Class_FE`. That last check is
+what distinguishes it from a ReSpeaker running USB-audio firmware, whose
+composite *parent* node also lacks `&MI_`. When such a USB-audio unit is
+present the wizard refuses XMOS flashing (ESP32-only stays available, since
+it never invokes `dfu-util`), mirroring the guard in the flash script.
+
 | Command | Effect |
 |---|---|
 | `info` | `WTCFG INFO host=… ssid=… build=…` |
