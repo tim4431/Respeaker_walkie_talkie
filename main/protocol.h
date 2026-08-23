@@ -36,6 +36,7 @@ typedef struct __attribute__((packed)) {
 #define WT_CTRL_STATUS_REQ 0x01  /* no body; reply goes to the requester */
 #define WT_CTRL_STATUS_RSP 0x02  /* body: wt_status_t */
 #define WT_CTRL_SET_PEER   0x03  /* body: wt_set_peer_t; ip 0 = back to auto */
+#define WT_CTRL_SET_VOL    0x04  /* body: wt_set_vol_t; reply: wt_status_t */
 
 typedef struct __attribute__((packed)) {
     uint8_t  cmd;        /* WT_CTRL_STATUS_RSP */
@@ -47,6 +48,8 @@ typedef struct __attribute__((packed)) {
     uint16_t peer_port;  /* network order; 0 if no peer */
     uint32_t peer_ip;    /* network order; 0 if no peer */
     char     hostname[24];
+    uint8_t  volume;     /* speaker volume, 0-100 (appended in proto v2;
+                            parsers must treat it as optional) */
 } wt_status_t;
 
 typedef struct __attribute__((packed)) {
@@ -55,3 +58,8 @@ typedef struct __attribute__((packed)) {
     uint16_t port;       /* network order */
     uint32_t ip;         /* network order; 0 clears the lock (auto mode) */
 } wt_set_peer_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t  cmd;        /* WT_CTRL_SET_VOL */
+    uint8_t  volume;     /* speaker volume percent, clamped to 0-100 */
+} wt_set_vol_t;

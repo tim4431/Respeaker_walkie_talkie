@@ -26,8 +26,9 @@ FLAG_CTRL = 0x02
 CTRL_STATUS_REQ = 0x01
 CTRL_STATUS_RSP = 0x02
 CTRL_SET_PEER = 0x03
-STATUS = struct.Struct("<BBBBBbHI24s")   # matches wt_status_t
-SET_PEER = struct.Struct("<BBHI")        # matches wt_set_peer_t
+CTRL_SET_VOL = 0x04
+STATUS = struct.Struct("<BBBBBbHI24s")   # wt_status_t (volume byte appended
+SET_PEER = struct.Struct("<BBHI")        # by newer firmware, parsed optionally)
 
 BG = "#1e1e28"
 PANEL = "#28283a"
@@ -186,12 +187,14 @@ class Monitor:
                 continue
             (_, _, muted, linked, locked, rssi,
              peer_port, peer_ip, host) = STATUS.unpack_from(body)
+            volume = body[STATUS.size] if len(body) > STATUS.size else None
             with self.lock:
                 d = self.devices.setdefault(addr[0], {"port": addr[1]})
                 d["name"] = host.split(b"\0")[0].decode(errors="replace") or addr[0]
                 d["status"] = {
                     "muted": muted, "linked": linked, "locked": locked,
                     "rssi": rssi, "peer_ip": peer_ip, "peer_port": peer_port,
+                    "volume": volume,
                 }
                 d["last_rsp"] = time.monotonic()
 
@@ -206,6 +209,16 @@ class Monitor:
         body = SET_PEER.pack(CTRL_SET_PEER, 0,
                              socket.htons(peer_port) if peer_ip_str else 0, ip_n)
         pkt = HDR.pack(MAGIC, 0, FLAG_CTRL, VERSION) + body
+        try:
+            self.sock.sendto(pkt, (dev_ip, dev_port))
+        except OSError:
+            pass
+
+    def set_volume(self, dev_ip, dev_port, volume):
+        """Set the device's speaker volume (0-100)."""
+        vol = max(0, min(100, int(volume)))
+        pkt = (HDR.pack(MAGIC, 0, FLAG_CTRL, VERSION)
+               + struct.pack("<BB", CTRL_SET_VOL, vol))
         try:
             self.sock.sendto(pkt, (dev_ip, dev_port))
         except OSError:
@@ -290,7 +303,7 @@ class App:
         root.title("Walkie-Talkie")
         root.configure(bg=BG)
         # fixed size: otherwise label text changes resize the whole window
-        root.geometry("665x445+120+120")
+        root.geometry("665x495+120+120")
         root.resizable(False, False)
         root.attributes("-topmost", True)
         root.after(1500, lambda: root.attributes("-topmost", False))
@@ -341,6 +354,29 @@ class App:
                   activebackground="#3a3a55", activeforeground=FG,
                   relief="flat").pack(side="left")
 
+        vol = tk.Frame(m, bg=BG)
+        vol.pack(fill="x", padx=14, pady=(8, 0))
+        slider_opts = dict(orient="horizontal", length=150, showvalue=False,
+                           bg=BG, fg=FG, troughcolor=PANEL,
+                           highlightthickness=0, sliderrelief="flat",
+                           activebackground=SEL)
+        tk.Label(vol, text="device spk", fg=DIM, bg=BG,
+                 font=("Segoe UI", 9)).pack(side="left")
+        self._dev_vol_guard = False   # True while set() mirrors device state
+        self._dev_vol_last_send = 0.0
+        self.dev_vol = tk.Scale(vol, from_=0, to=100,
+                                command=self._on_dev_vol, **slider_opts)
+        self.dev_vol.set(100)
+        self.dev_vol.pack(side="left", padx=(6, 0))
+        self.dev_vol.bind("<ButtonRelease-1>", self._on_dev_vol_release)
+        tk.Label(vol, text="PC out", fg=DIM, bg=BG,
+                 font=("Segoe UI", 9)).pack(side="left", padx=(14, 0))
+        self.pc_vol_gain = 1.0
+        self.pc_vol = tk.Scale(vol, from_=0, to=150,
+                               command=self._on_pc_vol, **slider_opts)
+        self.pc_vol.set(100)
+        self.pc_vol.pack(side="left", padx=(6, 0))
+
         self.tx_wave = WaveView(m, "PC mic -> device (TX)", TX_COLOR)
         self.rx_wave = WaveView(m, "device -> PC speakers (RX)", RX_COLOR)
         self.tx_wave.frame.pack(fill="x", padx=14, pady=(10, 0))
@@ -380,6 +416,38 @@ class App:
     def select(self, ip):
         self.selected = ip
         self.talk_btn.config(state="normal")
+        st = self.monitor.snapshot().get(ip, {}).get("status")
+        if st and st.get("volume") is not None:
+            self._dev_vol_guard = True
+            self.dev_vol.set(st["volume"])
+            self._dev_vol_guard = False
+
+    # ------------------------------------------------ volume
+
+    def _send_dev_vol(self):
+        devs = self.monitor.snapshot()
+        if self.selected in devs:
+            self.monitor.set_volume(self.selected,
+                                    devs[self.selected].get("port", PORT),
+                                    self.dev_vol.get())
+
+    def _on_dev_vol(self, _value):
+        if self._dev_vol_guard or not self.selected:
+            return
+        # throttle mid-drag updates; the release handler sends the final value
+        now = time.monotonic()
+        if now - self._dev_vol_last_send > 0.15:
+            self._dev_vol_last_send = now
+            self._send_dev_vol()
+
+    def _on_dev_vol_release(self, _event):
+        if self.selected:
+            self._send_dev_vol()
+
+    def _on_pc_vol(self, value):
+        self.pc_vol_gain = int(value) / 100.0
+        if self.client:
+            self.client.rx_volume = self.pc_vol_gain
 
     def _eff_state(self, ip, dev):
         """During a call, the call itself is the truth for that device -
@@ -405,6 +473,7 @@ class App:
         # audio rides TCP (immune to the router's UDP flow lottery);
         # UDP v2 with its own socket is the fallback for old firmware
         self.client = WalkieClient((self.selected, port))
+        self.client.rx_volume = self.pc_vol_gain
         self.client.start()
         self.talk_ip = self.selected
         self.talk_btn.config(text="Stop")
@@ -476,7 +545,9 @@ class App:
                         f"ip {self.selected}   rssi {st['rssi']} dBm   "
                         f"peer {self._peer_label(devs, st)}"
                         f"{'  [manual]' if st['locked'] else '  [auto]'}   "
-                        f"muted {'yes' if st['muted'] else 'no'}{extra}"))
+                        f"muted {'yes' if st['muted'] else 'no'}"
+                        f"{'   vol ' + str(st['volume']) if st.get('volume') is not None else ''}"
+                        f"{extra}"))
                 else:
                     self.info.config(
                         text=f"ip {self.selected}   (no status yet){extra}")

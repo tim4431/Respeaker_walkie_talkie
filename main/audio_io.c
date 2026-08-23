@@ -20,6 +20,9 @@ esp_err_t audio_init(void)
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_SLAVE);
     chan_cfg.dma_desc_num = 6;
     chan_cfg.dma_frame_num = 240;  /* 5 ms per descriptor */
+    /* On TX underrun send silence, not a loop of the last DMA buffer -
+     * without this a starved speaker path turns into buzzing noise. */
+    chan_cfg.auto_clear = true;
     ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &s_tx, &s_rx), TAG, "new channel");
 
     i2s_std_config_t std_cfg = {

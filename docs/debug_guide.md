@@ -16,10 +16,15 @@ DTX **off**. PC↔device audio runs over **TCP port 5010** (`[u16 len][opus]`
 stream, len 0 = heartbeat; device sends an identity banner frame starting with
 ASCII `WTKI` on accept — clients must not decode it as audio). Device↔device
 audio uses UDP protocol v2 on **port 5004** (see `main/protocol.h`: 8-byte
-header + batched `[u16 len][opus]` frames). Control (status query, manual peer
-assignment) is UDP on 5004 with `WT_FLAG_CTRL`; control packets never affect
-peer adoption. The device broadcasts an 8-byte presence packet to `:5004`
-every 2 s (discovery + AP keepalive).
+header + batched `[u16 len][opus]` frames). While a TCP client is connected,
+UDP audio is NOT inserted into the jitter buffer (the two seq spaces are
+unrelated; interleaving them garbles playback) — TCP wins. Control (status
+query, manual peer assignment, speaker volume `WT_CTRL_SET_VOL` 0–100,
+persisted in NVS) is UDP on 5004 with `WT_FLAG_CTRL`; control packets never
+affect peer adoption; every ctrl request is answered with `wt_status_t`,
+whose final byte is the current volume (older parsers may ignore it). The
+device broadcasts an 8-byte presence packet to `:5004` every 2 s (discovery +
+AP keepalive).
 
 ## Hardware connections (two different USB-C ports!)
 
@@ -119,7 +124,10 @@ TCP identity: connect to `<ip>:5010`, first frame is the `WTKI-...` build tag
   UDP batch fallback), playback(core1,prio10) drains the jitter buffer,
   rx_task(core0) handles UDP audio/ctrl, tcp_srv_task(core0) owns TCP 5010,
   housekeeping in app_main (button GPIO3, LED, keepalives, mDNS discovery).
-- Audio tasks need large stacks (24 KB) — libopus is stack-hungry.
+- Audio tasks need large stacks (48 KB) — libopus is stack-hungry: 24 KB
+  overflowed in opus_encode the moment a call started (panic + reboot on
+  every TCP connect; ~2 frames escaped per boot, so the PC saw a flat RX
+  waveform and choppy "noise" played on the device between reboots).
 - `tcp_send_frame` is called from two tasks; its static buffer must stay
   guarded by `s_tcp_tx_lock` (memcpy INSIDE the lock).
 - Device SNDTIMEO must stay generous (2 s): WiFi retry bursts stall sends

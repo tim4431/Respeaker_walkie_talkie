@@ -2,6 +2,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "driver/gpio.h"
@@ -15,9 +16,12 @@
 #include "led.h"
 
 static const char *TAG = "walkie";
-#define WT_BUILD_TAG "WTKI-2026-08-22-A"
+#define WT_BUILD_TAG "WTKI-2026-08-22-C"
 
 static volatile bool s_muted = false;
+static volatile uint8_t s_volume = 100;     /* speaker volume percent, 0-100 */
+static volatile bool s_vol_dirty = false;   /* pending NVS save (debounced) */
+static volatile int64_t s_vol_change_us = 0;
 static volatile uint32_t s_rx_dgrams = 0;   /* all valid datagrams */
 static volatile uint32_t s_rx_ctrl = 0;     /* ctrl requests handled */
 static volatile uint32_t s_tx_ctrl = 0;     /* ctrl replies sent OK */
@@ -130,6 +134,24 @@ static void capture_task(void *arg)
 
 /* ---------------- UDP -> jitter buffer ---------------- */
 
+static bool send_status_reply(const struct sockaddr_in *dst)
+{
+    uint8_t rsp[sizeof(wt_header_t) + sizeof(wt_status_t)];
+    wt_header_t rh = { .magic = WT_MAGIC, .seq = 0,
+                       .flags = WT_FLAG_CTRL,
+                       .version = WT_PROTO_VERSION };
+    memcpy(rsp, &rh, sizeof(rh));
+    wt_status_t *st = (wt_status_t *)(rsp + sizeof(rh));
+    net_fill_status(st, s_muted);
+    st->volume = s_volume;
+    if (s_tcp_fd >= 0) {  /* a TCP call counts as linked */
+        st->linked = 1;
+    }
+    int sn = sendto(net_socket(), rsp, sizeof(rsp), 0,
+                    (struct sockaddr *)dst, sizeof(*dst));
+    return sn == (int)sizeof(rsp);
+}
+
 static void rx_task(void *arg)
 {
     static uint8_t buf[sizeof(wt_header_t) + WT_MAX_BATCH * (2 + WT_MAX_PAYLOAD) + 64];
@@ -159,41 +181,38 @@ static void rx_task(void *arg)
             uint8_t cmd = buf[sizeof(wt_header_t)];
             if (cmd == WT_CTRL_STATUS_REQ) {
                 s_rx_ctrl++;
-                uint8_t rsp[sizeof(wt_header_t) + sizeof(wt_status_t)];
-                wt_header_t rh = { .magic = WT_MAGIC, .seq = 0,
-                                   .flags = WT_FLAG_CTRL,
-                                   .version = WT_PROTO_VERSION };
-                memcpy(rsp, &rh, sizeof(rh));
-                net_fill_status(rsp + sizeof(rh), s_muted);
-                if (s_tcp_fd >= 0) {  /* a TCP call counts as linked */
-                    ((wt_status_t *)(rsp + sizeof(rh)))->linked = 1;
-                }
-                int sn = sendto(net_socket(), rsp, sizeof(rsp), 0,
-                                (struct sockaddr *)&src, sizeof(src));
-                if (sn == (int)sizeof(rsp)) {
+                if (send_status_reply(&src)) {
                     s_tx_ctrl++;
                 } else {
-                    ESP_LOGW(TAG, "ctrl reply sendto failed: %d errno %d", sn, errno);
+                    ESP_LOGW(TAG, "ctrl reply sendto failed: errno %d", errno);
                 }
             } else if (cmd == WT_CTRL_SET_PEER &&
                        payload >= (int)sizeof(wt_set_peer_t)) {
                 wt_set_peer_t sp;
                 memcpy(&sp, buf + sizeof(wt_header_t), sizeof(sp));
                 net_set_peer_manual(sp.ip, sp.port);
-                uint8_t rsp[sizeof(wt_header_t) + sizeof(wt_status_t)];
-                wt_header_t rh = { .magic = WT_MAGIC, .seq = 0,
-                                   .flags = WT_FLAG_CTRL,
-                                   .version = WT_PROTO_VERSION };
-                memcpy(rsp, &rh, sizeof(rh));
-                net_fill_status(rsp + sizeof(rh), s_muted);
-                sendto(net_socket(), rsp, sizeof(rsp), 0,
-                       (struct sockaddr *)&src, sizeof(src));
+                send_status_reply(&src);
+            } else if (cmd == WT_CTRL_SET_VOL &&
+                       payload >= (int)sizeof(wt_set_vol_t)) {
+                wt_set_vol_t sv;
+                memcpy(&sv, buf + sizeof(wt_header_t), sizeof(sv));
+                uint8_t vol = sv.volume > 100 ? 100 : sv.volume;
+                if (vol != s_volume) {
+                    s_volume = vol;
+                    s_vol_dirty = true;
+                    s_vol_change_us = esp_timer_get_time();
+                    ESP_LOGI(TAG, "speaker volume set to %u%%", (unsigned)vol);
+                }
+                send_status_reply(&src);
             }
             continue;
         }
 
         net_note_rx_from(&src);
-        if ((hdr.flags & WT_FLAG_AUDIO) && payload > 0) {
+        /* While a TCP client is talking, the jitter buffer belongs to that
+         * stream: its seq space (0,1,2,...) is unrelated to a UDP peer's, and
+         * interleaving the two garbles playback into noise. TCP wins. */
+        if ((hdr.flags & WT_FLAG_AUDIO) && payload > 0 && s_tcp_fd < 0) {
             /* v2: [u16 len][opus frame] repeated, consecutive seq */
             const uint8_t *p = buf + sizeof(wt_header_t);
             int rem = payload;
@@ -214,6 +233,18 @@ static void rx_task(void *arg)
 }
 
 /* ---------------- jitter buffer -> decode -> playback ---------------- */
+
+static void apply_volume(int16_t *pcm)
+{
+    uint8_t vol = s_volume;
+    if (vol >= 100) {
+        return;
+    }
+    int32_t q = ((int32_t)vol << 15) / 100;  /* Q15 gain */
+    for (int i = 0; i < WT_FRAME_SAMPLES; i++) {
+        pcm[i] = (int16_t)(((int32_t)pcm[i] * q) >> 15);
+    }
+}
 
 static void playback_task(void *arg)
 {
@@ -265,6 +296,7 @@ static void playback_task(void *arg)
             expect++;
         }
 
+        apply_volume(pcm);
         audio_play(pcm);
     }
 }
@@ -405,6 +437,35 @@ static void tcp_srv_task(void *arg)
 
 /* ---------------- housekeeping: button, LED, discovery, keepalive ------- */
 
+static nvs_handle_t s_nvs;
+
+static void volume_nvs_load(void)
+{
+    if (nvs_open("walkie", NVS_READWRITE, &s_nvs) != ESP_OK) {
+        ESP_LOGW(TAG, "nvs_open failed; volume will not persist");
+        s_nvs = 0;
+        return;
+    }
+    uint8_t v;
+    if (nvs_get_u8(s_nvs, "spk_vol", &v) == ESP_OK && v <= 100) {
+        s_volume = v;
+        ESP_LOGI(TAG, "speaker volume restored: %u%%", (unsigned)v);
+    }
+}
+
+/* Debounced: flash writes briefly stall the other core's cache, so save
+ * once the slider has settled instead of on every drag tick. */
+static void volume_nvs_save_if_due(int64_t now)
+{
+    if (!s_vol_dirty || s_nvs == 0 || now - s_vol_change_us < 1000000) {
+        return;
+    }
+    s_vol_dirty = false;
+    if (nvs_set_u8(s_nvs, "spk_vol", s_volume) == ESP_OK) {
+        nvs_commit(s_nvs);
+    }
+}
+
 static void update_led(void)
 {
     if (s_muted) {
@@ -471,6 +532,7 @@ static void housekeeping_loop(void)
             net_discovery_poll();
         }
         net_check_peer_timeout();
+        volume_nvs_save_if_due(now);
         update_led();
 
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -488,6 +550,7 @@ void app_main(void)
     led_init();
     led_set_state(LED_STATE_WIFI_CONNECTING);
     s_tcp_tx_lock = xSemaphoreCreateMutex();
+    volume_nvs_load();
 
     ESP_ERROR_CHECK(net_wifi_start());
     ESP_ERROR_CHECK(net_udp_start());
@@ -495,10 +558,12 @@ void app_main(void)
     ESP_ERROR_CHECK(codec_init());
     jb_init();
 
-    /* Audio on core 1, network on core 0 (with the WiFi stack). Encode and
-     * decode both use significant stack in libopus. */
-    xTaskCreatePinnedToCore(capture_task, "capture", 24 * 1024, NULL, 10, NULL, 1);
-    xTaskCreatePinnedToCore(playback_task, "playback", 24 * 1024, NULL, 10, NULL, 1);
+    /* Audio on core 1, network on core 0 (with the WiFi stack). libopus is
+     * stack-hungry: opus_encode at 48 kHz overflowed a 24 KB stack the moment
+     * a call started (proven by a capture-task stack overflow panic on every
+     * TCP connect), so both audio tasks get 48 KB. */
+    xTaskCreatePinnedToCore(capture_task, "capture", 48 * 1024, NULL, 10, NULL, 1);
+    xTaskCreatePinnedToCore(playback_task, "playback", 48 * 1024, NULL, 10, NULL, 1);
     xTaskCreatePinnedToCore(rx_task, "udp_rx", 6 * 1024, NULL, 9, NULL, 0);
     xTaskCreatePinnedToCore(tcp_srv_task, "tcp_srv", 6 * 1024, NULL, 9, NULL, 0);
 

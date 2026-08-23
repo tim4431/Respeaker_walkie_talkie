@@ -23,6 +23,8 @@ import sys
 import threading
 import time
 
+from array import array
+
 import sounddevice as sd
 from pyogg import OpusDecoder, OpusEncoder
 
@@ -120,6 +122,8 @@ class WalkieClient:
 
     Readable attributes (updated continuously, safe to read from any thread):
       muted        - set True/False to stop/resume sending mic audio
+      rx_volume    - playback gain for the PC speakers (1.0 = unity, may
+                     exceed 1.0; output is clamped to int16)
       tx_count     - datagrams sent
       rx_count     - datagrams received
       last_rx_time - time.monotonic() of the last packet from the device
@@ -140,6 +144,7 @@ class WalkieClient:
         self.build_tag = None  # device firmware id from its TCP banner
         self.tcp = self._tcp_connect(timeout=3.0)  # None -> UDP fallback
         self.muted = False
+        self.rx_volume = 1.0
         self.tx_count = 0
         self.rx_count = 0
         self.last_rx_time = 0.0
@@ -413,7 +418,15 @@ class WalkieClient:
                     if misses > LOSS_RESET:
                         self.jb.clear()
                         playing = False
+                # waveform shows the device's signal regardless of local gain
                 self.last_rx_pcm = pcm
+                vol = self.rx_volume
+                if vol != 1.0 and pcm is not silence:
+                    samples = array("h")
+                    samples.frombytes(pcm)
+                    pcm = array("h", (
+                        min(32767, max(-32768, int(s * vol)))
+                        for s in samples)).tobytes()
                 spk.write(pcm)
 
 
