@@ -34,6 +34,15 @@ survive reboots.
 
 ## Hardware
 
+### Typical room setup
+
+Place the ReSpeaker Lite units in different rooms and connect both to the
+same local IP subnet. For example, the two units below use `192.168.1.41`
+and `192.168.1.42` on `192.168.1.0/24`; the addresses are illustrative and
+may be assigned automatically by your router.
+
+![Two ReSpeaker Lite devices in separate rooms, connected to the same IP subnet](docs/images/respeaker-lite-same-subnet-room.png)
+
 - 1 or more ReSpeaker Lite kits with XIAO ESP32-S3 pre-soldered
 - A speaker per unit (JST connector or the 3.5 mm jack)
 - USB-C power

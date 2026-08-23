@@ -16,6 +16,12 @@ Python client. Nodes are peers — there is no server, no cloud, and no
 central mixer. A node keeps a **send-list** (whom it transmits to) and
 plays back whatever arrives.
 
+For a device-to-device deployment, place the units in separate rooms and
+connect them to the same IP subnet. The addresses in this example are
+illustrative; DHCP may assign different addresses on the target network.
+
+![Two ReSpeaker Lite devices placed in separate rooms on the same IP subnet](images/respeaker-lite-same-subnet-room.png)
+
 ```mermaid
 flowchart LR
     subgraph U1["ReSpeaker Lite unit"]
