@@ -50,9 +50,15 @@ LOSS_RESET = 25
 # Voice-activated ("vox") TX mode: the PC has no echo canceller, so in this
 # mode the mic transmits only while it hears local speech AND the far end is
 # quiet - the device's audio can then never loop speakers->mic->device.
-# The TX threshold comes from the client's vox_sens (0-100, higher = opens
-# easier): rms_threshold = 50 + (100 - sens) * 19.5  (sens 75 ~ RMS 540).
-VOX_SENS_DEFAULT = 75
+# The TX gate opens above vox_thresh (0-100, higher = louder speech needed),
+# mapped quadratically onto mic RMS so the low end stays fine-grained:
+#   rms = 20 + thresh^2 * 0.3   (0 -> 20, 30 -> 290, 100 -> 3020)
+# Speech is typically RMS 500-3000; a quiet room is under ~100.
+VOX_THRESH_DEFAULT = 30
+
+
+def vox_rms_of(thresh):
+    return 20.0 + thresh * thresh * 0.3
 VOX_RX_RMS = 250.0   # far-end RMS that counts as "someone else speaking"
 VOX_TX_HANG = 0.6    # keep transmitting this long after the last voiced frame
 VOX_RX_HANG = 0.4    # keep TX blocked this long after far-end speech
@@ -179,8 +185,9 @@ class WalkieClient:
         self.muted = False
         self.mode = "full"
         self.tx_active = False
-        self.vox_sens = VOX_SENS_DEFAULT  # 0-100, see VOX_SENS_DEFAULT note
+        self.vox_thresh = VOX_THRESH_DEFAULT  # 0-100, see vox_rms_of()
         self.tx_gain = 1.0   # mic gain (0.0-2.0); scales level/VOX/encode
+        self.mic_rms = 0.0   # latest mic frame RMS (post-gain), for UIs
         self.rx_volume = 1.0
         self._tx_hold_until = 0.0
         self._rx_active_until = 0.0
@@ -248,7 +255,8 @@ class WalkieClient:
         return math.sqrt(acc / max(n, 1))
 
     def _tx_allowed(self, pcm):
-        """Gate for one mic frame; also maintains tx_active for UIs."""
+        """Gate for one mic frame; also maintains tx_active/mic_rms for UIs."""
+        self.mic_rms = self._rms(pcm)
         if self.muted:
             self.tx_active = False
             return False
@@ -257,8 +265,8 @@ class WalkieClient:
             return True
         now = time.monotonic()
         # far end has priority: local speech only opens TX while RX is quiet
-        th = 50 + (100 - self.vox_sens) * 19.5
-        if self._rms(pcm) >= th and now >= self._rx_active_until:
+        if (self.mic_rms >= vox_rms_of(self.vox_thresh)
+                and now >= self._rx_active_until):
             self._tx_hold_until = now + VOX_TX_HANG
         self.tx_active = now < self._tx_hold_until
         return self.tx_active

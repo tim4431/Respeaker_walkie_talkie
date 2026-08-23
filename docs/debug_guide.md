@@ -32,15 +32,18 @@ a `WalkieClient(targets=[...], use_tcp=False)` on the shared socket.
 
 Control on UDP 5004 with `WT_FLAG_CTRL`: `SET_VOL` (0x04, volume 0–100,
 NVS), `SET_MODE` (0x05, 0 = always transmit, 1 = VOX/voice-activated, NVS),
-`SET_MUTE` (0x06, not persisted), `SET_GROUP` (0x07), `SET_SENS` (0x08, mic
-sensitivity 0–100, NVS; VOX TX threshold = `1000 + (100 - sens) * 190` in
-peak16 units), `SET_GAIN` (0x09, mic gain 0–200 %, NVS; saturating digital
-gain applied to captured samples before level/VOX/encode), plus status/peer
-as before. Control never affects peer
+`SET_MUTE` (0x06, not persisted), `SET_GROUP` (0x07), `SET_THRESH` (0x08, VOX
+TX threshold 0–100, NVS; higher = louder speech needed, mapped quadratically
+onto peak16 by `WT_VOX_PEAK_OF`: `150 + thresh² * 2`, default 30 ≈ peak
+1950), `SET_GAIN` (0x09, mic gain 0–200 %, NVS; saturating digital gain
+applied to captured samples before level/VOX/encode — so gain also shifts
+where the gate opens), plus status/peer as before. Control never affects peer
 adoption. Every ctrl request is answered with `wt_status_t`, which appends
 optional fields after hostname: volume, tx_mode, tx_active, rx_active,
-member_count, members[8], mic_level (frame peak >> 7), vox_sens, mic_gain —
-parse by length. VOX timing lives in `app_config.h` (`WT_VOX_*`). The device
+member_count, members[8], mic_level (frame peak >> 7), vox_thresh, mic_gain —
+parse by length. The PC client mirrors the same knobs on RMS
+(`vox_rms_of`: `20 + thresh² * 0.3`); the GUI draws each node's gate as a
+dashed line on its waveform, so "level above the line = transmitting". VOX timing lives in `app_config.h` (`WT_VOX_*`). The device
 broadcasts an 8-byte presence packet to `:5004` every 2 s (discovery + AP
 keepalive). GUI group semantics: the GUI stores the group structure
 (multi-group) in `gui_settings.json`, pushes each device's union send-list,

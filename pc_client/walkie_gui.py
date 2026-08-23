@@ -25,7 +25,7 @@ from array import array
 from collections import deque
 from pathlib import Path
 
-from walkie_pc import HDR, MAGIC, PORT, VERSION, WalkieClient
+from walkie_pc import (HDR, MAGIC, PORT, VERSION, WalkieClient, vox_rms_of)
 
 SETTINGS_PATH = Path(__file__).with_name("gui_settings.json")
 
@@ -36,6 +36,8 @@ CTRL_SET_VOL = 0x04
 CTRL_SET_MODE = 0x05
 CTRL_SET_MUTE = 0x06
 CTRL_SET_GROUP = 0x07
+CTRL_SET_THRESH = 0x08
+CTRL_SET_GAIN = 0x09
 STATUS = struct.Struct("<BBBBBbHI24s")   # wt_status_t base (36 B); the
 MEMBER = struct.Struct("<IH")            # extension fields are optional
 
@@ -201,7 +203,7 @@ class Monitor:
             "muted": muted, "linked": linked, "locked": locked,
             "rssi": rssi, "volume": None, "tx_mode": None,
             "tx_active": 0, "rx_active": 0, "members": [], "mic_level": 0,
-            "vox_sens": None, "mic_gain": None,
+            "vox_thresh": None, "mic_gain": None,
         }
         off = STATUS.size
         for i, n in enumerate(("volume", "tx_mode", "tx_active", "rx_active")):
@@ -221,7 +223,7 @@ class Monitor:
         if len(body) > lvl_off:
             st["mic_level"] = body[lvl_off]
         if len(body) > lvl_off + 1:
-            st["vox_sens"] = body[lvl_off + 1]
+            st["vox_thresh"] = body[lvl_off + 1]
         if len(body) > lvl_off + 2:
             st["mic_gain"] = body[lvl_off + 2]
         host_s = host.split(b"\0")[0].decode(errors="replace")
@@ -287,9 +289,9 @@ class Monitor:
     def set_mute(self, ip, port, muted):
         self._ctrl(ip, port, struct.pack("<BB", CTRL_SET_MUTE, 1 if muted else 0))
 
-    def set_sens(self, ip, port, sens):
-        self._ctrl(ip, port, struct.pack("<BB", CTRL_SET_SENS,
-                                         max(0, min(100, int(sens)))))
+    def set_thresh(self, ip, port, thresh):
+        self._ctrl(ip, port, struct.pack("<BB", CTRL_SET_THRESH,
+                                         max(0, min(100, int(thresh)))))
 
     def set_gain(self, ip, port, gain):
         self._ctrl(ip, port, struct.pack("<BB", CTRL_SET_GAIN,
@@ -346,8 +348,9 @@ class MiniWave:
         self.levels = deque([0.0] * self.BARS, maxlen=self.BARS)
         self.color = color
         self.bars = []
+        self.gate = []      # threshold guide lines
 
-    def push(self, level):
+    def push(self, level, thresh_level=None, gate_on=True):
         self.levels.append(max(0.0, min(1.0, level)))
         c = self.canvas
         w = max(c.winfo_width(), 60)
@@ -358,11 +361,53 @@ class MiniWave:
             self.bars = [c.create_line(0, mid, 0, mid, fill=self.color,
                                        width=3, capstyle="round")
                          for _ in range(self.BARS)]
+            self.gate = []
         span = mid - 4
         for i, lv in enumerate(self.levels):
             x = (i + 1) * step
             hh = max(1.2, lv * span)
             c.coords(self.bars[i], x, mid - hh, x, mid + hh)
+        # dashed line showing where the voice gate opens
+        if thresh_level is None:
+            for g in self.gate:
+                c.itemconfigure(g, state="hidden")
+        else:
+            gh = max(1.0, min(1.0, thresh_level) * span)
+            if not self.gate:
+                self.gate = [c.create_line(0, 0, 0, 0, dash=(3, 3))
+                             for _ in range(2)]
+            # solid grey while the gate is armed (voice mode), pale when the
+            # node transmits unconditionally and the line is only a preview
+            col = "#7c869c" if gate_on else "#cdd4e0"
+            for g, y in zip(self.gate, (mid - gh, mid + gh)):
+                c.coords(g, 0, y, w, y)
+                c.itemconfigure(g, state="normal", fill=col)
+            for g in self.gate:
+                c.tag_raise(g)
+
+
+def rms_to_level(rms):
+    """Same curve pcm_level() uses, so a gate line lands where the bars do."""
+    return min(1.0, math.sqrt(rms / 32768.0) * 1.8)
+
+
+def peak_to_level(peak16):
+    """Device levels are frame PEAKS, the PC's are RMS, so they get their own
+    constant - but the same sqrt curve, or one card looks dead next to the
+    other."""
+    return min(1.0, math.sqrt(max(0.0, peak16) / 32768.0) * 1.2)
+
+
+def dev_mic_level(mic_level):
+    """wt_status_t.mic_level (peak16 >> 7) -> 0-1 for drawing."""
+    return peak_to_level(int(mic_level) * 128)
+
+
+def dev_gate_level(thresh):
+    """Device VOX threshold knob -> the same 0-1 scale (WT_VOX_PEAK_OF)."""
+    if thresh is None:
+        return None
+    return peak_to_level(150 + int(thresh) * int(thresh) * 2)
 
 
 def pcm_level(pcm_bytes):
@@ -457,8 +502,8 @@ class App:
 
         root.title("Walkie Group")
         root.configure(bg=BG)
-        root.geometry("1040x760+80+40")
-        root.minsize(900, 640)
+        root.geometry("1040x620+80+40")
+        root.minsize(900, 560)
 
         self._build_header()
         self._build_cards_panel()
@@ -504,7 +549,7 @@ class App:
                                  font=(FONT, 9))
         self.grp_note.pack(side="right")
         self.groups_row = tk.Frame(panel, bg=CARD)
-        self.groups_row.pack(fill="both", expand=True, padx=8, pady=8)
+        self.groups_row.pack(fill="x", anchor="n", padx=8, pady=8)
 
     # ------------------------------------------------ node model
 
@@ -521,11 +566,17 @@ class App:
         devs = self.monitor.snapshot()
         c = self.active_pc_client()
         pc_level = pcm_level(c.last_tx_pcm) if c else 0.0
+        # gate line in the same normalized units the waveforms draw in
+        pc_thresh = int(self.settings.get("pc_thresh", 30))
+        pc_gate = rms_to_level(vox_rms_of(pc_thresh))
         out = [{
             "id": "pc", "key": "pc", "name": "This PC", "is_pc": True,
             "online": True, "tx": bool(c and c.tx_active),
             "rx": bool(c and time.monotonic() - c.last_rx_time < 0.5),
-            "muted": self.pc_muted, "level": pc_level, "dev": None,
+            "muted": self.pc_muted, "level": pc_level, "gate": pc_gate,
+            "gate_on": self.tx_mode == "vox",
+            "voice": bool(c and pc_level >= pc_gate),
+            "dev": None,
             "state": "muted" if self.pc_muted else "idle",
             "sub": "in group" if self.group_client else
                    (f"calling {self.talk_ip}" if self.client else "ready"),
@@ -546,8 +597,12 @@ class App:
                 "online": bool(fresh), "tx": bool(fresh and st.get("tx_active")),
                 "rx": bool(fresh and st.get("rx_active")),
                 "muted": bool(st.get("muted")),
-                "level": (st.get("mic_level", 0) / 255.0) * 1.6
-                         if fresh else 0.0,
+                "level": dev_mic_level(st.get("mic_level", 0)) if fresh else 0.0,
+                "gate": dev_gate_level(st.get("vox_thresh")),
+                "gate_on": bool(st.get("tx_mode")),
+                "voice": bool(fresh and st.get("tx_active")
+                              and dev_mic_level(st.get("mic_level", 0))
+                              >= (dev_gate_level(st.get("vox_thresh")) or 0)),
                 "dev": dev, "state": state, "sub": sub,
             })
         return out
@@ -616,9 +671,9 @@ class App:
             lambda v, i=n["id"]: self._on_card_gain(i, v, False),
             lambda v, i=n["id"]: self._on_card_gain(i, v, True), vmax=200)
         sens, sens_pct = bar_row(
-            "sens", RX_COLOR,
-            lambda v, i=n["id"]: self._on_card_sens(i, v, False),
-            lambda v, i=n["id"]: self._on_card_sens(i, v, True))
+            "gate", RX_COLOR,
+            lambda v, i=n["id"]: self._on_card_thresh(i, v, False),
+            lambda v, i=n["id"]: self._on_card_thresh(i, v, True))
         tk.Frame(f, bg=CARD2, height=4).pack()
 
         for w in (hdrrow, name, wave.canvas):
@@ -641,10 +696,14 @@ class App:
         cw["dot"].itemconfig(cw["oid"], fill=COLORS[n["state"]])
         cw["name"].config(text=n["name"])
         cw["sub"].config(text=n["sub"])
-        if n["tx"]:
-            cw["badge"].config(text="SPEAKING", bg=TX_COLOR)
-        elif n["muted"]:
+        # "SPEAKING" must mean voice, not merely transmitting: an always-mode
+        # node sends every frame, so it would otherwise never stop saying it
+        if n["muted"]:
             cw["badge"].config(text="MUTED", bg=COLORS["muted"])
+        elif n["tx"] and n["voice"]:
+            cw["badge"].config(text="SPEAKING", bg=TX_COLOR)
+        elif n["tx"]:
+            cw["badge"].config(text="ON AIR", bg="#f0a868")
         elif n["rx"]:
             cw["badge"].config(text="HEARING", bg=RX_COLOR)
         else:
@@ -670,11 +729,11 @@ class App:
         st = (n["dev"] or {}).get("status") or {}
         if n["is_pc"]:
             vol_val = min(100, int(self.settings.get("pc_vol", 100)))
-            sens_val = int(self.settings.get("pc_sens", 75))
+            sens_val = int(self.settings.get("pc_thresh", 30))
             gain_val = int(self.settings.get("pc_gain", 100))
         else:
             vol_val = st.get("volume")
-            sens_val = st.get("vox_sens")
+            sens_val = st.get("vox_thresh")
             gain_val = st.get("mic_gain")
         if vol_val is not None and not cw["vol_init"]:
             cw["vol"].set(vol_val)
@@ -770,25 +829,25 @@ class App:
                 if dev:
                     self.monitor.set_gain(nid, dev.get("port", PORT), value)
 
-    def _on_card_sens(self, nid, value, final):
+    def _on_card_thresh(self, nid, value, final):
         value = int(value)
         cw = self.cards.get(nid)
         if cw:
             cw["sens_init"] = True
             cw["sens_pct"].config(text=f"{value}")
         if nid == "pc":
-            self.settings["pc_sens"] = value
+            self.settings["pc_thresh"] = value
             save_settings(self.settings)
             for c in (self.client, self.group_client):
                 if c:
-                    c.vox_sens = value
+                    c.vox_thresh = value
         else:
             now = time.monotonic()
             if cw and (final or now - cw["last_sens_send"] > 0.15):
                 cw["last_sens_send"] = now
                 dev = self.monitor.snapshot().get(nid)
                 if dev:
-                    self.monitor.set_sens(nid, dev.get("port", PORT), value)
+                    self.monitor.set_thresh(nid, dev.get("port", PORT), value)
 
     def toggle_talk(self, ip):
         if self.client:
@@ -811,7 +870,7 @@ class App:
 
     def _apply_pc_client_prefs(self, c):
         c.rx_volume = min(100, int(self.settings.get("pc_vol", 100))) / 100.0
-        c.vox_sens = int(self.settings.get("pc_sens", 75))
+        c.vox_thresh = int(self.settings.get("pc_thresh", 30))
         c.tx_gain = int(self.settings.get("pc_gain", 100)) / 100.0
         c.mode = self.tx_mode
         c.muted = self.pc_muted
@@ -878,8 +937,9 @@ class App:
     # ------------------------------------------------ groups panel
 
     def _groups_signature(self, nodes):
-        online = {n["key"]: (n["online"], n["tx"]) for n in nodes}
-        return json.dumps(self.groups) + repr(sorted(online.items()))
+        """Structure only - live talk/online state is repainted by
+        _draw_group_graphs() instead of rebuilding widgets."""
+        return json.dumps(self.groups) + repr(sorted(n["key"] for n in nodes))
 
     def _rebuild_groups(self, nodes):
         sig = self._groups_signature(nodes)
@@ -889,12 +949,11 @@ class App:
         for w in self.groups_row.winfo_children():
             w.destroy()
         self.group_boxes = []
-        info = {n["key"]: n for n in nodes}
         for gi, g in enumerate(self.groups):
             box = card(self.groups_row, bg=CARD2)
-            box.pack(side="left", fill="y", padx=4, pady=2, ipadx=4)
+            box.pack(side="left", anchor="n", padx=4, pady=2)
             head = tk.Frame(box, bg=CARD2)
-            head.pack(fill="x", padx=6, pady=(5, 2))
+            head.pack(fill="x", padx=8, pady=(6, 2))
             nm = tk.Label(head, text=g.get("name", f"Group {gi + 1}"),
                           fg=FG, bg=CARD2, font=(FONT, 10, "bold"))
             nm.pack(side="left")
@@ -903,42 +962,111 @@ class App:
                       bg=CARD2, fg=DIM, activebackground=CARD2,
                       activeforeground=FG, relief="flat", bd=0,
                       font=(FONT, 9)).pack(side="right")
+            graph = tk.Canvas(box, width=228, height=168, bg="#fbfcfe",
+                              highlightthickness=1,
+                              highlightbackground=BORDER)
+            graph.pack(padx=8, pady=(0, 4))
             chips = tk.Frame(box, bg=CARD2)
-            chips.pack(fill="both", expand=True, padx=6, pady=(0, 6))
-            if not g["members"]:
-                tk.Label(chips, text="drop nodes here", fg=DIM, bg=CARD2,
-                         font=(FONT, 9, "italic")).pack(padx=10, pady=10)
+            chips.pack(fill="x", padx=8, pady=(0, 7))
             for key in g["members"]:
-                n = info.get(key)
-                talking = bool(n and n["tx"])
-                online = bool(n and n["online"])
-                chip = tk.Frame(chips,
-                                bg=TX_COLOR if talking else
-                                ("#e2e8f5" if online else "#eceff5"))
-                chip.pack(fill="x", pady=2)
-                tk.Label(chip, text=(n["name"] if n else key),
-                         bg=chip["bg"],
-                         fg="#ffffff" if talking else
-                         (FG if online else DIM),
-                         font=(FONT, 9,
-                               "bold" if talking else "normal"),
-                         padx=6, pady=2).pack(side="left")
+                chip = tk.Frame(chips, bg="#e6eaf4")
+                chip.pack(side="left", padx=(0, 4), pady=1)
+                tk.Label(chip, text=key if key != "pc" else "This PC",
+                         bg="#e6eaf4", fg=DIM, font=(FONT, 8),
+                         padx=4).pack(side="left")
                 tk.Button(chip, text="✕",
                           command=lambda i=gi, k=key: self._chip_remove(i, k),
-                          bg=chip["bg"], fg="#ffffff" if talking else DIM,
-                          activebackground=chip["bg"], activeforeground=FG,
-                          relief="flat", bd=0,
-                          font=(FONT, 8)).pack(side="right", padx=(6, 2))
-            self.group_boxes.append({"frame": box})
+                          bg="#e6eaf4", fg=DIM, activebackground="#e6eaf4",
+                          activeforeground=FG, relief="flat", bd=0,
+                          font=(FONT, 7)).pack(side="right")
+            self.group_boxes.append({"frame": box, "graph": graph,
+                                     "index": gi})
         self.new_group_btn = tk.Label(self.groups_row,
                                       text="+\nnew group\n(drop here)",
                                       fg=DIM, bg=CARD,
                                       highlightbackground=BORDER,
                                       highlightthickness=1,
                                       font=(FONT, 9), justify="center",
-                                      padx=16, pady=14)
-        self.new_group_btn.pack(side="left", padx=6, pady=2, fill="y")
+                                      padx=22, pady=60)
+        self.new_group_btn.pack(side="left", anchor="n", padx=6, pady=2)
         self.new_group_btn.bind("<Button-1>", lambda e: self._add_group([]))
+
+    def _draw_group_graphs(self, nodes):
+        """Live hub-and-spoke per group: who is in it, who is broadcasting."""
+        info = {n["key"]: n for n in nodes}
+        pulse = 2.5 + 1.5 * math.sin(time.monotonic() * 6)
+        for box in self.group_boxes:
+            gi = box["index"]
+            if gi >= len(self.groups):
+                continue
+            c = box["graph"]
+            c.delete("all")
+            w = max(int(c["width"]), 60)
+            h = max(int(c["height"]), 60)
+            members = self.groups[gi]["members"]
+            cx, cy = w / 2, h / 2 - 4
+            if not members:
+                c.create_text(cx, cy, text="drop nodes here", fill=DIM,
+                              font=(FONT, 9, "italic"))
+                continue
+            talkers = [k for k in members
+                       if info.get(k) and info[k]["tx"] and info[k]["voice"]]
+            # hub: lights up while someone holds the floor
+            hub_r = 15
+            c.create_oval(cx - hub_r, cy - hub_r, cx + hub_r, cy + hub_r,
+                          fill="#fff2e8" if talkers else "#eef2ff",
+                          outline=TX_COLOR if talkers else ACCENT, width=2)
+            c.create_text(cx, cy, text="((•))" if talkers else "•••",
+                          fill=TX_COLOR if talkers else ACCENT,
+                          font=(FONT, 7, "bold"))
+            n = len(members)
+            radius = min(w, h) * 0.34
+            for i, key in enumerate(members):
+                node = info.get(key)
+                ang = -math.pi / 2 + i * (2 * math.pi / n)
+                x = cx + radius * math.cos(ang)
+                y = cy + radius * 0.78 * math.sin(ang)
+                online = bool(node and node["online"])
+                muted = bool(node and node["muted"])
+                speaking = bool(node and node["tx"] and node["voice"])
+                on_air = bool(node and node["tx"] and not speaking)
+                hearing = bool(node and node["rx"])
+                col = (COLORS["muted"] if muted else
+                       COLORS["linked"] if online else COLORS["offline"])
+                # spoke: audio flowing from this node to the rest
+                if speaking:
+                    c.create_line(x, y, cx, cy, fill=TX_COLOR, width=3,
+                                  arrow="last", arrowshape=(7, 8, 3))
+                elif on_air:
+                    c.create_line(x, y, cx, cy, fill="#f0a868", width=2)
+                else:
+                    c.create_line(cx, cy, x, y, fill=BORDER, width=1)
+                r = 15
+                if speaking:
+                    c.create_oval(x - r - 3 - pulse, y - r - 3 - pulse,
+                                  x + r + 3 + pulse, y + r + 3 + pulse,
+                                  outline=TX_COLOR, width=2)
+                elif hearing:
+                    c.create_oval(x - r - 3, y - r - 3, x + r + 3, y + r + 3,
+                                  outline=RX_COLOR, width=1, dash=(2, 2))
+                c.create_oval(x - r, y - r, x + r, y + r, fill=CARD,
+                              outline=col, width=2)
+                c.create_text(x, y, text="PC" if key == "pc" else "WT",
+                              fill=FG if online else DIM,
+                              font=(FONT, 8, "bold"))
+                label = "This PC" if key == "pc" else (
+                    node["name"] if node else key)
+                if len(label) > 14:
+                    label = label[:13] + "…"
+                ly = y + r + 8 if math.sin(ang) >= -0.1 else y - r - 8
+                c.create_text(x, ly, text=label, fill=FG if online else DIM,
+                              font=(FONT, 7))
+            status = ("  ".join(("This PC" if k == "pc" else k) + " speaking"
+                                for k in talkers[:2])
+                      if talkers else "idle")
+            c.create_text(w / 2, h - 7, text=status,
+                          fill=TX_COLOR if talkers else DIM,
+                          font=(FONT, 7, "bold" if talkers else "normal"))
 
     def _add_group(self, members):
         self.groups.append({"name": f"Group {len(self.groups) + 1}",
@@ -1252,8 +1380,11 @@ class App:
         for nid, cw in self.cards.items():
             n = by_id.get(nid)
             if n:
-                cw["wave"].push(n["level"])
+                cw["wave"].push(n["level"], n.get("gate"),
+                                n.get("gate_on", True))
 
+        if self._tick_n % 2 == 0:  # 10 Hz: live group graphs
+            self._draw_group_graphs(nodes)
         if self._tick_n % 8 == 0:  # 2.5 Hz: cards, groups, header
             self._refresh_cards(nodes)
             self._rebuild_groups(nodes)

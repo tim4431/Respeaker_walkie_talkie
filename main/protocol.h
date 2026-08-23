@@ -41,8 +41,8 @@ typedef struct __attribute__((packed)) {
 #define WT_CTRL_SET_MUTE   0x06  /* body: u8 0/1 (not persisted) */
 #define WT_CTRL_SET_GROUP  0x07  /* body: u8 count + count * wt_member_t;
                                     count 0 leaves the group. Persisted. */
-#define WT_CTRL_SET_SENS   0x08  /* body: u8 mic sensitivity 0-100 (VOX TX
-                                    threshold; higher = opens easier).
+#define WT_CTRL_SET_THRESH 0x08  /* body: u8 VOX TX threshold 0-100 (higher
+                                    = louder speech needed to transmit).
                                     Persisted. */
 #define WT_CTRL_SET_GAIN   0x09  /* body: u8 mic gain percent 0-200 (digital,
                                     saturating; scales the captured signal
@@ -78,7 +78,7 @@ typedef struct __attribute__((packed)) {
     uint8_t  member_count;             /* group members (not counting self) */
     wt_member_t members[WT_MAX_MEMBERS];
     uint8_t  mic_level;  /* latest 20 ms mic frame peak, peak16 >> 7 */
-    uint8_t  vox_sens;   /* mic sensitivity 0-100 (see WT_CTRL_SET_SENS) */
+    uint8_t  vox_thresh; /* VOX TX threshold 0-100 (WT_CTRL_SET_THRESH) */
     uint8_t  mic_gain;   /* mic gain percent 0-200 (see WT_CTRL_SET_GAIN) */
 } wt_status_t;
 

@@ -1,133 +1,220 @@
 # ReSpeaker Lite IP Walkie-Talkie
 
-Full-duplex, two-way intercom over WiFi for two **Seeed ReSpeaker Lite kits
-(with XIAO ESP32-S3)**. Audio is captured through the XMOS XU316 front-end
-(AEC / noise suppression / AGC — this is what makes speakerphone-style full
-duplex possible), compressed with **Opus** (~24 kbps, DTX + in-band FEC), and
-streamed peer-to-peer over **UDP** on the local network. Units find each other
-automatically via **mDNS**.
+Full-duplex WiFi intercom and **group chat** for
+[Seeed ReSpeaker Lite](https://www.seeedstudio.com/ReSpeaker-Lite-p-5928.html)
+kits with a XIAO ESP32-S3 — plus a PC client that joins as an equal node.
 
-```
-mics → XU316 (AEC/NS/AGC) → I2S → ESP32-S3 → Opus encode → UDP ⇄ UDP → jitter
-buffer → Opus decode → I2S → XU316 → codec/amp → speaker
-```
+Audio is captured through the XMOS XU316 front-end (AEC / noise suppression /
+AGC — this is what makes open-speaker full duplex possible), compressed with
+**Opus** at 48 kHz, and streamed peer-to-peer on the local network. There is
+no server and no cloud. Units discover each other via mDNS and presence
+broadcasts, and each device **remembers its own configuration** — WiFi, volume,
+mic gain, TX mode and group membership all live in the device's NVS and
+survive reboots.
 
-Mouth-to-ear latency is roughly 100 ms on a normal LAN (20 ms frame + ~60 ms
-jitter buffer + network/DMA).
+![The Walkie Group control centre](docs/images/gui-overview.png)
 
-> Working on this repo with an AI assistant? Point it at
-> [docs/AI_AGENT_GUIDE.md](docs/AI_AGENT_GUIDE.md) — connection, flashing,
-> and debugging procedures, including the hardware and network pitfalls.
+---
+
+## What you can do
+
+- **Talk between two or more ReSpeaker units** over WiFi, hands-free.
+- **Use your PC as another walkie** — same protocol, same group.
+- **Group chat**: drag nodes into groups; a node can be in several groups.
+  One speaker holds the floor at a time.
+- **See who is talking, live** — per-node waveforms, SPEAKING / ON AIR /
+  HEARING / MUTED badges, and a broadcast graph per group.
+- **Tune each node remotely**: speaker volume, mic gain, voice-activation
+  gate, mute, and always-on vs voice-activated transmission.
+- **Provision a fresh unit over USB** — no WiFi credentials baked into the
+  firmware image.
+
+---
 
 ## Hardware
 
-- 2 × ReSpeaker Lite kit with XIAO ESP32-S3 pre-soldered
-- 2 × speakers on the JST connector (or the 3.5 mm jack)
+- 1 or more ReSpeaker Lite kits with XIAO ESP32-S3 pre-soldered
+- A speaker per unit (JST connector or the 3.5 mm jack)
 - USB-C power
 
-Pinout used (fixed by the kit wiring):
+Two different USB-C ports matter: the **XIAO's** port is for ESP32 flashing,
+the serial console and USB provisioning; the **ReSpeaker board's** own port is
+for XMOS DFU firmware only.
 
-| Signal | GPIO |
-|---|---|
-| I2S BCLK | 8 |
-| I2S LRCLK/WS | 7 |
-| Mic data (XMOS → ESP) | 44 |
-| Speaker data (ESP → XMOS) | 43 |
-| WS2812 LED | 1 |
-| USER button | 3 |
+The XMOS must run the **48 kHz I2S** firmware. The flash script checks this
+and upgrades it automatically.
 
-The ESP32-S3 runs as **I2S slave** — the XU316 is clock master at 48 kHz,
-32-bit stereo slots. Opus is fed 48 kHz directly and capped at wideband, so no
-manual resampling code is needed.
+Seeed documentation:
+[Getting Started with reSpeaker Lite](https://wiki.seeedstudio.com/reSpeaker_usb_v3/) ·
+[ReSpeaker Lite + XIAO ESP32S3 kit](https://wiki.seeedstudio.com/xiao_respeaker/) ·
+[XMOS firmware repository](https://github.com/respeaker/ReSpeaker_Lite) ·
+[product page](https://www.seeedstudio.com/ReSpeaker-Lite-p-5928.html)
 
-## Flashing (automated)
+---
 
-`tools\flash_all.ps1` detects and flashes both processors of a connected unit:
+## Quick start
+
+### 1. Flash a unit
+
+Requires [ESP-IDF v5.4](https://docs.espressif.com/projects/esp-idf/en/v5.4/esp32s3/get-started/).
+One command handles both processors:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\flash_all.ps1
 ```
 
-- **XMOS XU316** (plug in the ReSpeaker Lite's own USB-C): reads the USB DFU
-  revision and, unless it already reports the 48 kHz v1.1.0 I2S firmware
-  (rev `0110`), flashes `tools\firmware\respeaker_lite_i2s_dfu_firmware_48k_v1.1.0_ch0-asr_ch1-mww.bin`
-  with dfu-util. On the first run per PC it launches Zadig for the one-time
-  WinUSB driver install (select *ReSpeaker Lite* → *Install Driver*), then
-  continues automatically.
-- **ESP32-S3** (plug in the XIAO's USB-C): finds the Espressif COM port and
-  runs `idf.py flash`. Use `-Monitor` to attach the serial monitor after,
-  `-EspOnly` / `-XmosOnly` to restrict, `-Port COMx` to override detection.
+- **XMOS XU316** — plug in the *ReSpeaker board's* USB-C. The script reads the
+  USB DFU revision and flashes the 48 kHz I2S firmware only if needed. On the
+  first run per PC it launches Zadig for the one-time WinUSB driver install
+  (select *ReSpeaker Lite* → *Install Driver*), then continues.
+- **ESP32-S3** — plug in the *XIAO's* USB-C. The script finds the Espressif
+  COM port and runs `idf.py flash`.
 
-Set your WiFi credentials once by copying `wifi.conf.example` to `wifi.conf`
-(gitignored) and filling in `WIFI_SSID` / `WIFI_PASSWORD` — the flash script
-applies it to the build automatically. (Alternatively use `idf.py menuconfig`
-→ Walkie-Talkie Configuration.)
+Useful flags: `-EspOnly`, `-XmosOnly`, `-Port COMx`, `-Monitor`.
 
-(Manual XMOS flashing, if you ever need it:
-`dfu-util -R -e -a 1 -D tools\firmware\respeaker_lite_i2s_dfu_firmware_48k_v1.1.0_ch0-asr_ch1-mww.bin`
-— see the [Seeed DFU guide](https://github.com/respeaker/ReSpeaker_Lite/blob/master/xmos_firmwares/dfu_guide.md).)
+> ⚠️ If you own a second ReSpeaker used as a USB microphone, unplug it before
+> XMOS flashing. The script refuses to run when it detects one.
 
-Repeat for the second unit (same config is fine — units identify themselves by
-MAC-derived hostname `walkie-xxxxxx.local`). With more than two units on the
-network, each unit pairs with the first peer it hears; use a static peer IP
-(`menuconfig → Static peer IP`) to pin pairs.
-
-## PC client
-
-With only one unit (or for testing), your PC can be the other walkie-talkie —
-it speaks the same UDP/Opus protocol:
+### 2. Install the PC client
 
 ```powershell
 cd pc_client
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
-.venv\Scripts\python walkie_gui.py        # GUI: state, stats, live waveforms, mute
-.venv\Scripts\python walkie_pc.py         # headless CLI version
 ```
 
-The GUI shows every walkie on the network in a sidebar (state dot: gray
-offline, blue idle, green linked, purple muted), live status (RSSI, mute,
-current peer) via a control protocol the firmware answers, waveforms while
-talking, and a peer dropdown to pair any two devices (both directions,
-locked until set back to "Auto"; manual pairing is volatile across reboots).
-Control packets never influence peer adoption, so monitoring is always safe.
+### 3. Give the unit WiFi (no reflash needed)
 
-Both programs discover devices via mDNS (or pass `--ip`). Use headphones —
-the PC side has no echo cancellation.
+Credentials are **not** baked in at flash time. With the XIAO's USB-C plugged
+in, start the GUI and click **WiFi via USB…**:
+
+```powershell
+.venv\Scripts\python walkie_gui.py
+```
+
+<img src="docs/images/gui-wifi-usb.png" alt="WiFi provisioning over USB" width="330">
+
+Pick the COM port, enter SSID and password, and **Apply**. The device stores
+them in NVS and reboots onto your network. Repeat per unit — each identifies
+itself by a MAC-derived hostname like `walkie-f6dd60`.
+
+*Alternative:* copy `wifi.conf.example` → `wifi.conf` at the repo root and the
+flash script will bake those credentials in as a fallback. Anything stored
+over USB takes priority.
+
+---
+
+## Using the GUI
+
+The window has two halves: **nodes** on top, **groups** below.
+
+### Node cards
+
+Each node — every walkie plus *This PC* — gets a card with:
+
+| Element | Meaning |
+|---|---|
+| Status dot | grey offline · blue idle · green linked · purple muted |
+| Waveform | live mic level; the dashed line is the voice gate |
+| Badge | **SPEAKING** (voice detected) · **ON AIR** (transmitting, no voice) · **HEARING** · **MUTED** |
+| **Mute** | toggles that node's mic (devices too, remotely) |
+| **TX: always / voice** | transmit continuously, or only when speaking |
+| **Call** | direct 1:1 TCP call between this PC and that device |
+| `vol` | speaker volume, 0–100 % |
+| `gain` | mic gain, 0–200 % — scales the waveform, the gate and what is sent |
+| `gate` | voice-activation threshold; higher = louder speech required |
+
+**Tuning voice mode:** switch TX to *voice*, then watch your own waveform
+while talking — set `gate` so speech crosses the dashed line and room noise
+does not. Raise `gain` first if the waveform barely moves.
+
+### Groups
+
+Drag a node card into a group box, or onto **+ new group** to start one. A
+node may belong to several groups. Double-click a group's name to rename it,
+`✕` on a chip to remove that member, `✕` in the header to delete the group.
+
+Each group draws a live hub-and-spoke graph: an orange arrow into the hub
+marks whoever is broadcasting, amber marks a node transmitting without voice,
+a dashed green ring marks a node that is hearing audio.
+
+Membership is pushed to the devices and stored in their NVS, so
+**device-to-device groups keep working after you close the GUI**. The GUI
+re-asserts the layout every few seconds, so a unit that reboots rejoins on its
+own. A device can hold up to 8 members.
+
+### Echo
+
+Your PC has no echo canceller (the ReSpeakers do, in the XMOS). Either use
+headphones, or set the PC to **TX: voice** so it stops transmitting while the
+far end is talking.
+
+---
+
+## Headless client
+
+```powershell
+.venv\Scripts\python walkie_pc.py            # discover via mDNS
+.venv\Scripts\python walkie_pc.py --ip 192.168.1.42
+```
+
+---
 
 ## LED states
 
-| Color | Meaning |
+| Colour | Meaning |
 |---|---|
 | Orange | Connecting to WiFi |
-| Blue | On WiFi, searching for a peer (mDNS) |
-| Green | Linked — full-duplex audio flowing |
-| Purple | Mic muted (USER button toggles) |
+| Blue | On WiFi, no peer |
+| Green | Linked |
+| Purple | Mic muted |
 
-The small round button labeled **MUTE** is handled by the XMOS in hardware and
-also works. The **USER** button toggles software mute (TX stops entirely).
+The board's round **MUTE** button is handled by the XMOS in hardware. The
+**USER** button (GPIO3) toggles software mute; mute always resets to *live*
+on boot.
 
-## Design notes
+---
 
-- **Transport:** one UDP datagram per 20 ms frame with an 8-byte header
-  (magic, sequence, flags). Peer address is learned via mDNS
-  (`_walkie._udp`) and refreshed from every received datagram.
-- **Opus settings:** VOIP mode, 24 kbps, complexity 3, DTX (silence costs
-  ~nothing — DTX frames double as keepalives), in-band FEC with 10 % expected
-  loss. A lost frame is first recovered from the next packet's FEC data,
-  otherwise concealed (PLC).
-- **Jitter buffer:** 32 slots of encoded packets, 3-frame (~60 ms) prefill,
-  frame-drop above 8 to absorb clock drift between the two units' crystals,
-  re-buffer after ~0.5 s of continuous loss.
-- **WiFi power save is disabled** (`WIFI_PS_NONE`) — modem sleep otherwise
-  causes periodic 100-300 ms dropouts.
-- **AEC reference:** everything we play is written through the XU316, so its
-  echo canceller sees the far-end signal automatically — that's what stops
-  the remote voice from being re-transmitted back.
+## How it works, briefly
 
-## Tuning
+```
+mics → XU316 (AEC/NS/AGC) → I2S → ESP32-S3 → gain → VOX gate → Opus encode
+     → UDP 5004 (groups) / TCP 5010 (PC call) ⇄ → jitter buffer
+     → Opus decode → volume → I2S → XU316 → speaker
+```
 
-- Choppy audio on busy WiFi → raise `WT_JB_PREFILL` (latency ↑, robustness ↑).
-- "encode overrun" warnings in the log → lower Opus complexity in menuconfig.
-- Bandwidth: ~24 kbps + UDP/IP overhead per direction while talking; ~2 kbps
-  when silent (DTX).
+Opus 48 kHz mono, 20 ms frames, 24 kbps VOIP mode with in-band FEC. The
+jitter buffer prefills ~60 ms, recovers losses from FEC, conceals the rest,
+and drops a frame when it creeps up to absorb clock drift. Mouth-to-ear
+latency is roughly 100 ms on a healthy LAN.
+
+Full details — protocol reference, state storage, VOX curves, tuning
+constants — are in **[docs/technical_spec.md](docs/technical_spec.md)**.
+
+---
+
+## Repository layout
+
+| Path | Contents |
+|---|---|
+| `main/` | ESP-IDF firmware (audio, codec, jitter buffer, network, console, LED) |
+| `pc_client/` | `walkie_gui.py` (GUI) and `walkie_pc.py` (client library + CLI) |
+| `tools/` | `flash_all.ps1`, XMOS firmware, Zadig |
+| `docs/` | [technical spec](docs/technical_spec.md), [debug guide](docs/debug_guide.md) |
+
+Working on this repo with an AI assistant? Point it at
+[docs/debug_guide.md](docs/debug_guide.md) — hardware access, flashing and
+debugging procedures, including the pitfalls that cost real time.
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| Device never appears | Check WiFi credentials via USB console (`info`); LED orange = still connecting |
+| `esptool` "Write timeout" | COM port wedged — unplug and replug the XIAO cable |
+| Choppy audio | Raise `WT_JB_PREFILL` (latency ↑, robustness ↑) |
+| "encode overrun" in the log | Lower Opus complexity in `menuconfig` |
+| PC group audio goes quiet | Some routers blackhole UDP flows — re-apply the group to get a fresh socket |
+| Constant transmission | That node is in **TX: always**; switch it to **voice** |

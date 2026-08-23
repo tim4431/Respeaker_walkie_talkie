@@ -17,7 +17,7 @@
 #include "console.h"
 
 static const char *TAG = "walkie";
-#define WT_BUILD_TAG "WTKI-2026-08-22-H"
+#define WT_BUILD_TAG "WTKI-2026-08-22-I"
 
 static volatile bool s_muted = false;
 static volatile uint8_t s_volume = 100;     /* speaker volume percent, 0-100 */
@@ -26,7 +26,7 @@ static volatile int64_t s_vol_change_us = 0;
 static volatile uint8_t s_tx_mode = WT_TXMODE_ALWAYS;  /* NVS-persisted */
 static volatile bool s_tx_active = false;   /* transmitting right now */
 static volatile uint8_t s_mic_level = 0;    /* latest frame peak >> 7 */
-static volatile uint8_t s_vox_sens = WT_VOX_SENS_DEFAULT;  /* NVS-persisted */
+static volatile uint8_t s_vox_thresh = WT_VOX_THRESH_DEFAULT;  /* NVS */
 static volatile uint8_t s_mic_gain = 100;   /* percent, 0-200, NVS-persisted */
 static volatile int64_t s_last_play_us = 0; /* last real far-end frame played */
 static nvs_handle_t s_nvs;
@@ -100,7 +100,7 @@ static void capture_task(void *arg)
              * the XMOS AEC keeps speaker audio out of the mic, so the
              * far end can't hold the gate open. */
             int64_t nowv = esp_timer_get_time();
-            int32_t th = 1000 + (100 - (int32_t)s_vox_sens) * 190;
+            int32_t th = WT_VOX_PEAK_OF(s_vox_thresh);
             if (fpeak >= th &&
                 nowv - s_last_play_us > WT_VOX_RX_BLOCK_US) {
                 vox_hold_until = nowv + WT_VOX_TX_HANG_US;
@@ -194,7 +194,7 @@ static bool send_status_reply(const struct sockaddr_in *dst)
     st->rx_active =
         (esp_timer_get_time() - s_last_play_us < 400 * 1000) ? 1 : 0;
     st->mic_level = s_mic_level;
-    st->vox_sens = s_vox_sens;
+    st->vox_thresh = s_vox_thresh;
     st->mic_gain = s_mic_gain;
     if (s_tcp_fd >= 0) {  /* a TCP call counts as linked */
         st->linked = 1;
@@ -269,18 +269,19 @@ static void rx_task(void *arg)
                              m == WT_TXMODE_VOX ? "voice" : "always");
                 }
                 send_status_reply(&src);
-            } else if (cmd == WT_CTRL_SET_SENS && payload >= 2) {
+            } else if (cmd == WT_CTRL_SET_THRESH && payload >= 2) {
                 uint8_t sv = buf[sizeof(wt_header_t) + 1];
                 if (sv > 100) {
                     sv = 100;
                 }
-                if (sv != s_vox_sens) {
-                    s_vox_sens = sv;
+                if (sv != s_vox_thresh) {
+                    s_vox_thresh = sv;
                     if (s_nvs) {
-                        nvs_set_u8(s_nvs, "vox_sens", sv);
+                        nvs_set_u8(s_nvs, "vox_th", sv);
                         nvs_commit(s_nvs);
                     }
-                    ESP_LOGI(TAG, "mic sensitivity set to %u", (unsigned)sv);
+                    ESP_LOGI(TAG, "vox threshold set to %u (peak %ld)",
+                             (unsigned)sv, (long)WT_VOX_PEAK_OF(sv));
                 }
                 send_status_reply(&src);
             } else if (cmd == WT_CTRL_SET_GAIN && payload >= 2) {
@@ -576,9 +577,9 @@ static void settings_nvs_load(void)
         ESP_LOGI(TAG, "tx mode restored: %s",
                  v == WT_TXMODE_VOX ? "voice" : "always");
     }
-    if (nvs_get_u8(s_nvs, "vox_sens", &v) == ESP_OK && v <= 100) {
-        s_vox_sens = v;
-        ESP_LOGI(TAG, "mic sensitivity restored: %u", (unsigned)v);
+    if (nvs_get_u8(s_nvs, "vox_th", &v) == ESP_OK && v <= 100) {
+        s_vox_thresh = v;
+        ESP_LOGI(TAG, "vox threshold restored: %u", (unsigned)v);
     }
     if (nvs_get_u8(s_nvs, "mic_gain", &v) == ESP_OK && v <= 200) {
         s_mic_gain = v;

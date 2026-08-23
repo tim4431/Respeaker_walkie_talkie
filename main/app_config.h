@@ -40,11 +40,13 @@
 #define WT_DISCOVERY_US     (5 * 1000 * 1000)
 
 /* Device-side VOX (WT_TXMODE_VOX): open TX when the frame's peak exceeds
- * the sensitivity-derived threshold (post-AGC speech peaks >= ~10000; quiet
- * room < ~2000) and the speaker has been quiet for RX_BLOCK; hold TX open
- * for HANG. Threshold = 1000 + (100 - sens) * 190 (sens set by
- * WT_CTRL_SET_SENS, persisted; 100 = hair trigger, 0 = needs shouting). */
-#define WT_VOX_SENS_DEFAULT 70
+ * the threshold and the speaker has been quiet for RX_BLOCK; hold TX open
+ * for HANG. The 0-100 knob (WT_CTRL_SET_THRESH, persisted) maps
+ * quadratically onto peak16 so the low end stays fine-grained:
+ *   peak = 150 + thresh^2 * 2   (0 -> 150, 30 -> 1950, 100 -> 20150)
+ * Post-AGC speech peaks are ~10000-30000; a quiet room is a few hundred. */
+#define WT_VOX_THRESH_DEFAULT 30
+#define WT_VOX_PEAK_OF(th)  (150 + (int32_t)(th) * (int32_t)(th) * 2)
 #define WT_VOX_TX_HANG_US   (700 * 1000)
 #define WT_VOX_RX_BLOCK_US  (400 * 1000)
 
