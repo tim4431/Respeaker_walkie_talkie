@@ -24,3 +24,17 @@ void net_note_rx_from(const struct sockaddr_in *src);
  * the caller), and expire a peer that has gone silent. */
 void net_discovery_poll(void);
 void net_check_peer_timeout(void);
+
+/* Manual peer control (WT_CTRL_SET_PEER). ip/port in network order;
+ * ip == 0 clears the lock and returns to auto discovery/adoption. */
+void net_set_peer_manual(uint32_t ip, uint16_t port);
+
+/* Fill a status reply for WT_CTRL_STATUS_REQ. */
+struct wt_status;
+void net_fill_status(void *status, bool muted);
+
+const char *net_hostname(void);
+
+/* Broadcast a tiny presence packet on the walkie port (AP keepalive +
+ * discovery). */
+void net_send_presence(const void *buf, size_t len);

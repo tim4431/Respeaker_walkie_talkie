@@ -15,6 +15,10 @@ buffer → Opus decode → I2S → XU316 → codec/amp → speaker
 Mouth-to-ear latency is roughly 100 ms on a normal LAN (20 ms frame + ~60 ms
 jitter buffer + network/DMA).
 
+> Working on this repo with an AI assistant? Point it at
+> [docs/AI_AGENT_GUIDE.md](docs/AI_AGENT_GUIDE.md) — connection, flashing,
+> and debugging procedures, including the hardware and network pitfalls.
+
 ## Hardware
 
 - 2 × ReSpeaker Lite kit with XIAO ESP32-S3 pre-soldered
@@ -81,8 +85,15 @@ python -m venv .venv
 .venv\Scripts\python walkie_pc.py         # headless CLI version
 ```
 
-Both discover the device via mDNS (or pass `--ip`). Use headphones — the PC
-side has no echo cancellation.
+The GUI shows every walkie on the network in a sidebar (state dot: gray
+offline, blue idle, green linked, purple muted), live status (RSSI, mute,
+current peer) via a control protocol the firmware answers, waveforms while
+talking, and a peer dropdown to pair any two devices (both directions,
+locked until set back to "Auto"; manual pairing is volatile across reboots).
+Control packets never influence peer adoption, so monitoring is always safe.
+
+Both programs discover devices via mDNS (or pass `--ip`). Use headphones —
+the PC side has no echo cancellation.
 
 ## LED states
 

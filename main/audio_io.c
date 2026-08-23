@@ -12,6 +12,7 @@ static i2s_chan_handle_t s_rx;
 /* 32-bit stereo scratch buffers for one frame (7680 bytes each) */
 static int32_t s_rx_raw[WT_FRAME_SAMPLES * 2];
 static int32_t s_tx_raw[WT_FRAME_SAMPLES * 2];
+static int32_t s_raw_peak;
 
 esp_err_t audio_init(void)
 {
@@ -56,10 +57,20 @@ esp_err_t audio_capture(int16_t *mono)
         got += n;
     }
     /* Channel 0 = processed mic; samples are MSB-aligned in the 32-bit slot. */
+    int32_t rp = 0;
     for (int i = 0; i < WT_FRAME_SAMPLES; i++) {
-        mono[i] = (int16_t)(s_rx_raw[2 * i] >> 16);
+        int32_t raw = s_rx_raw[2 * i];
+        int32_t a = raw < 0 ? -raw : raw;
+        if (a > rp) rp = a;
+        mono[i] = (int16_t)(raw >> 16);
     }
+    s_raw_peak = rp;
     return ESP_OK;
+}
+
+int32_t audio_last_raw_peak(void)
+{
+    return s_raw_peak;
 }
 
 esp_err_t audio_play(const int16_t *mono)

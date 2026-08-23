@@ -1,6 +1,7 @@
 #include <string.h>
 #include "net.h"
 #include "app_config.h"
+#include "protocol.h"
 #include "sdkconfig.h"
 
 #include "freertos/FreeRTOS.h"
@@ -24,8 +25,10 @@ static int s_sock = -1;
 static SemaphoreHandle_t s_peer_lock;
 static struct sockaddr_in s_peer;
 static bool s_have_peer;
-static bool s_static_peer;
+static bool s_static_peer;   /* Kconfig static IP */
+static bool s_locked_peer;   /* manual WT_CTRL_SET_PEER */
 static int64_t s_last_rx_us;
+static uint32_t s_own_ip;
 
 static char s_hostname[32];
 
@@ -41,6 +44,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "got IP " IPSTR, IP2STR(&ev->ip_info.ip));
+        s_own_ip = ev->ip_info.ip.addr;
         xEventGroupSetBits(s_wifi_ev, WIFI_CONNECTED_BIT);
     }
 }
@@ -52,7 +56,14 @@ esp_err_t net_wifi_start(void)
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    esp_netif_t *sta = esp_netif_create_default_wifi_sta();
+
+    /* Show up as "walkie-xxxxxx" in the router's client list instead of
+     * lwIP's default "espressif". */
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    snprintf(s_hostname, sizeof(s_hostname), "walkie-%02x%02x%02x", mac[3], mac[4], mac[5]);
+    esp_netif_set_hostname(sta, s_hostname);
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -92,10 +103,8 @@ esp_err_t net_udp_start(void)
         ESP_LOGE(TAG, "bind() failed: errno %d", errno);
         return ESP_FAIL;
     }
-
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    snprintf(s_hostname, sizeof(s_hostname), "walkie-%02x%02x%02x", mac[3], mac[4], mac[5]);
+    int bc = 1;
+    setsockopt(s_sock, SOL_SOCKET, SO_BROADCAST, &bc, sizeof(bc));
 
     ESP_ERROR_CHECK(mdns_init());
     ESP_ERROR_CHECK(mdns_hostname_set(s_hostname));
@@ -143,7 +152,18 @@ void net_send(const void *buf, size_t len)
 
 void net_note_rx_from(const struct sockaddr_in *src)
 {
+    if (src->sin_addr.s_addr == s_own_ip) {
+        return;  /* our own broadcast echoed back */
+    }
     xSemaphoreTake(s_peer_lock, portMAX_DELAY);
+    if (s_locked_peer) {
+        /* manual pairing: only the assigned peer refreshes liveness */
+        if (src->sin_addr.s_addr == s_peer.sin_addr.s_addr) {
+            s_last_rx_us = esp_timer_get_time();
+        }
+        xSemaphoreGive(s_peer_lock);
+        return;
+    }
     if (!s_static_peer) {
         if (!s_have_peer) {
             ESP_LOGI(TAG, "peer adopted from RX: %s", inet_ntoa(src->sin_addr));
@@ -155,9 +175,71 @@ void net_note_rx_from(const struct sockaddr_in *src)
     xSemaphoreGive(s_peer_lock);
 }
 
+void net_set_peer_manual(uint32_t ip, uint16_t port)
+{
+    xSemaphoreTake(s_peer_lock, portMAX_DELAY);
+    if (ip == 0) {
+        s_locked_peer = false;
+        s_have_peer = false;
+        ESP_LOGI(TAG, "manual peer cleared - back to auto");
+    } else {
+        memset(&s_peer, 0, sizeof(s_peer));
+        s_peer.sin_family = AF_INET;
+        s_peer.sin_addr.s_addr = ip;
+        s_peer.sin_port = port ? port : htons(CONFIG_WT_UDP_PORT);
+        s_have_peer = true;
+        s_locked_peer = true;
+        s_last_rx_us = esp_timer_get_time();
+        ESP_LOGI(TAG, "manual peer set: %s:%u", inet_ntoa(s_peer.sin_addr),
+                 (unsigned)ntohs(s_peer.sin_port));
+    }
+    xSemaphoreGive(s_peer_lock);
+}
+
+void net_fill_status(void *status, bool muted)
+{
+    wt_status_t *st = (wt_status_t *)status;
+    memset(st, 0, sizeof(*st));
+    st->cmd = WT_CTRL_STATUS_RSP;
+    st->proto = WT_PROTO_VERSION;
+    st->muted = muted ? 1 : 0;
+
+    wifi_ap_record_t ap;
+    st->rssi = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) ? ap.rssi : 0;
+
+    xSemaphoreTake(s_peer_lock, portMAX_DELAY);
+    st->linked = (s_have_peer &&
+                  esp_timer_get_time() - s_last_rx_us < 3 * 1000 * 1000) ? 1 : 0;
+    st->peer_locked = s_locked_peer ? 1 : 0;
+    if (s_have_peer) {
+        st->peer_ip = s_peer.sin_addr.s_addr;
+        st->peer_port = s_peer.sin_port;
+    }
+    xSemaphoreGive(s_peer_lock);
+    strlcpy(st->hostname, s_hostname, sizeof(st->hostname));
+}
+
+const char *net_hostname(void)
+{
+    return s_hostname;
+}
+
+void net_send_presence(const void *buf, size_t len)
+{
+    /* Broadcast a tiny packet: keeps the AP's station state fresh (some
+     * consumer APs stop delivering downlink to a long-silent STA) and
+     * doubles as peer discovery - idle units adopt each other from it. */
+    struct sockaddr_in bcast = {
+        .sin_family = AF_INET,
+        .sin_port = htons(CONFIG_WT_UDP_PORT),
+        .sin_addr.s_addr = htonl(INADDR_BROADCAST),
+    };
+    sendto(s_sock, buf, len, 0, (struct sockaddr *)&bcast, sizeof(bcast));
+}
+
 void net_discovery_poll(void)
 {
-    if (s_static_peer || net_peer_known()) {
+    if (s_static_peer || s_locked_peer || net_peer_known()) {
         return;
     }
     mdns_result_t *results = NULL;
@@ -192,7 +274,7 @@ void net_discovery_poll(void)
 void net_check_peer_timeout(void)
 {
     xSemaphoreTake(s_peer_lock, portMAX_DELAY);
-    if (!s_static_peer && s_have_peer &&
+    if (!s_static_peer && !s_locked_peer && s_have_peer &&
         esp_timer_get_time() - s_last_rx_us > WT_PEER_TIMEOUT_US) {
         s_have_peer = false;
         ESP_LOGW(TAG, "peer lost (no packets for %d s)",

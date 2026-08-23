@@ -12,3 +12,7 @@ esp_err_t audio_capture(int16_t *mono);
 
 /* Blocking write of one 20 ms mono frame to the XMOS (speaker + AEC reference). */
 esp_err_t audio_play(const int16_t *mono);
+
+/* Peak |raw 32-bit slot value| of the last captured frame (debug: shows
+ * whether the XMOS delivers signal at all and how it is bit-aligned). */
+int32_t audio_last_raw_peak(void);

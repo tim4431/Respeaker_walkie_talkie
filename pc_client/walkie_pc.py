@@ -27,9 +27,14 @@ import sounddevice as sd
 from pyogg import OpusDecoder, OpusEncoder
 
 MAGIC = 0x314B5457  # "WTK1"
-VERSION = 1
+VERSION = 2
 FLAG_AUDIO = 0x01
 HDR = struct.Struct("<IHBB")  # magic, seq, flags, version
+
+# v2 batching: several [u16 len][opus frame] entries per datagram, hdr.seq
+# is the first frame's; keeps packet rate below router flood-protection
+# thresholds (50 pps of tiny UDP looks like an attack to some routers).
+FRAMES_PER_PKT = 3
 
 RATE = 48000
 FRAME = 960  # 20 ms
@@ -123,18 +128,34 @@ class WalkieClient:
       jb_depth()   - current jitter buffer depth in frames
     """
 
-    def __init__(self, target):
+    def __init__(self, target, sock=None, external_rx=False):
+        """Audio transport is TCP on target_port+1 (this router forwards TCP
+        perfectly while randomly blackholing UDP flows); falls back to the
+        v2 UDP protocol if the TCP connect fails (older firmware).
+
+        sock/external_rx: share an existing UDP socket whose flow the router
+        already forwards - the owner then feeds incoming audio via
+        handle_audio() instead of our own rx loop. UDP fallback only."""
         self.target = target
+        self.build_tag = None  # device firmware id from its TCP banner
+        self.tcp = self._tcp_connect(timeout=3.0)  # None -> UDP fallback
         self.muted = False
         self.tx_count = 0
         self.rx_count = 0
         self.last_rx_time = 0.0
         self.last_tx_pcm = b""
         self.last_rx_pcm = b""
+        self._own_sock = sock is None
+        self._external_rx = external_rx
 
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind(("", 0))
-        self.sock.settimeout(1.0)
+        if sock is not None:
+            self.sock = sock
+        else:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sock.bind(("", 0))
+            self.sock.settimeout(1.0)
+        self.rebinds = 0
+        self._last_rebind = time.monotonic()
 
         self.enc = OpusEncoder()
         self.enc.set_application("voip")
@@ -152,21 +173,76 @@ class WalkieClient:
     def linked(self):
         return time.monotonic() - self.last_rx_time < 3.0
 
+    def _rebind(self):
+        """Move to a fresh source port: some routers' flow-offload engines
+        blackhole individual UDP flows; a new 5-tuple gets a fresh chance
+        (the device re-adopts us from the first packet it hears)."""
+        old = self.sock
+        new = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        new.bind(("", 0))
+        new.settimeout(1.0)
+        self.sock = new
+        try:
+            old.close()
+        except OSError:
+            pass
+        self.rebinds += 1
+        self._last_rebind = time.monotonic()
+
     def jb_depth(self):
         return self.jb.depth()
 
     def start(self):
-        for f in (self._tx_loop, self._rx_loop, self._play_loop):
+        if self.tcp is not None:
+            loops = [self._tcp_tx_loop, self._tcp_rx_loop, self._play_loop]
+        else:
+            loops = [self._tx_loop, self._play_loop]
+            if not self._external_rx:
+                loops.append(self._rx_loop)
+        for f in loops:
             t = threading.Thread(target=f, daemon=True)
             t.start()
             self._threads.append(t)
 
     def stop(self):
         self._stop.set()
-        self.sock.close()
+        if self.tcp is not None:
+            try:
+                self.tcp.close()
+            except OSError:
+                pass
+        if self._own_sock:
+            self.sock.close()
 
-    def _tx_loop(self):
-        seq = 0
+    # ---- TCP transport: [u16 len][opus frame] stream, len 0 = heartbeat
+
+    def _tcp_connect(self, timeout=2.0):
+        try:
+            t = socket.create_connection((self.target[0], self.target[1] + 6),
+                                         timeout=timeout)
+            t.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            t.settimeout(1.0)
+            return t
+        except OSError:
+            return None
+
+    def _tcp_reconnect(self):
+        """Replace a dead connection; returns once connected or stopping."""
+        try:
+            self.tcp.close()
+        except OSError:
+            pass
+        while not self._stop.is_set():
+            t = self._tcp_connect()
+            if t is not None:
+                self.tcp = t
+                self.jb.clear()
+                self.reconnects = getattr(self, "reconnects", 0) + 1
+                return
+            time.sleep(1.0)
+
+    def _tcp_tx_loop(self):
+        last_hb = 0.0
         with sd.RawInputStream(samplerate=RATE, channels=1, dtype="int16",
                                blocksize=FRAME) as mic:
             while not self._stop.is_set():
@@ -174,33 +250,135 @@ class WalkieClient:
                 pcm = bytes(pcm)
                 self.last_tx_pcm = pcm
                 if self.muted:
+                    # heartbeat so the device knows we're alive, not a zombie
+                    now = time.monotonic()
+                    if now - last_hb > 0.5:
+                        last_hb = now
+                        try:
+                            self.tcp.sendall(b"\x00\x00")
+                        except OSError:
+                            pass
                     continue
-                packet = self.enc.encode(pcm)
-                hdr = HDR.pack(MAGIC, seq & 0xFFFF, FLAG_AUDIO, VERSION)
+                packet = bytes(self.enc.encode(pcm))
                 try:
-                    self.sock.sendto(hdr + bytes(packet), self.target)
+                    self.tcp.sendall(struct.pack("<H", len(packet)) + packet)
                 except OSError:
-                    break
-                seq += 1
+                    if self._stop.is_set():
+                        break
+                    time.sleep(0.1)
+                    continue
                 self.tx_count += 1
+
+    def _tcp_recv_all(self, n):
+        buf = b""
+        while len(buf) < n and not self._stop.is_set():
+            try:
+                chunk = self.tcp.recv(n - len(buf))
+            except socket.timeout:
+                continue
+            except OSError:
+                return None
+            if not chunk:
+                return None
+            buf += chunk
+        return buf if len(buf) == n else None
+
+    def _tcp_rx_loop(self):
+        seq = 0
+        while not self._stop.is_set():
+            hdr = self._tcp_recv_all(2)
+            if hdr is None:
+                self._tcp_reconnect()
+                continue
+            (flen,) = struct.unpack("<H", hdr)
+            if flen > 512:  # desynced/corrupt stream: start over
+                self._tcp_reconnect()
+                continue
+            self.last_rx_time = time.monotonic()
+            if flen == 0:
+                continue  # heartbeat
+            frame = self._tcp_recv_all(flen)
+            if frame is None:
+                self._tcp_reconnect()
+                continue
+            if frame.startswith(b"WTKI"):
+                self.build_tag = frame.decode(errors="replace")
+                continue  # identity banner, not audio
+            self.rx_count += 1
+            self.jb.insert(seq, frame)
+            seq = (seq + 1) & 0xFFFF
+
+    def handle_audio(self, seq, body):
+        """Feed a received audio payload (v2 batch, header stripped)."""
+        self.last_rx_time = time.monotonic()
+        self.rx_count += 1
+        pos = 0
+        while pos + 2 < len(body):
+            (flen,) = struct.unpack_from("<H", body, pos)
+            pos += 2
+            if flen == 0 or pos + flen > len(body):
+                break
+            self.jb.insert(seq, body[pos:pos + flen])
+            seq = (seq + 1) & 0xFFFF
+            pos += flen
+
+    def _tx_loop(self):
+        seq = 0
+        batch = []
+        batch_seq = 0
+        with sd.RawInputStream(samplerate=RATE, channels=1, dtype="int16",
+                               blocksize=FRAME) as mic:
+            while not self._stop.is_set():
+                pcm, _ = mic.read(FRAME)
+                pcm = bytes(pcm)
+                self.last_tx_pcm = pcm
+                if self.muted:
+                    batch.clear()
+                    continue
+                packet = bytes(self.enc.encode(pcm))
+                if not batch:
+                    batch_seq = seq
+                batch.append(struct.pack("<H", len(packet)) + packet)
+                seq += 1
+                if len(batch) < FRAMES_PER_PKT:
+                    continue
+                hdr = HDR.pack(MAGIC, batch_seq & 0xFFFF, FLAG_AUDIO, VERSION)
+                try:
+                    self.sock.sendto(hdr + b"".join(batch), self.target)
+                except OSError:
+                    if self._stop.is_set():
+                        break
+                self.tx_count += len(batch)
+                batch.clear()
+                # flow watchdog: sending but hearing nothing -> new flow
+                # (own socket only; a shared socket's flow is managed by
+                # its owner and is already known-good)
+                now = time.monotonic()
+                if (self._own_sock and now - self.last_rx_time > 2.5 and
+                        now - self._last_rebind > 2.5):
+                    self._rebind()
 
     def _rx_loop(self):
         while not self._stop.is_set():
             try:
-                data, _ = self.sock.recvfrom(2048)
+                data, _ = self.sock.recvfrom(4096)
             except socket.timeout:
                 continue
             except OSError:
-                break
+                if self._stop.is_set():
+                    break
+                time.sleep(0.05)  # socket was rebound; pick up the new one
+                continue
             if len(data) <= HDR.size:
                 continue
             magic, seq, flags, version = HDR.unpack_from(data)
             if magic != MAGIC or version != VERSION:
                 continue
-            self.last_rx_time = time.monotonic()
-            self.rx_count += 1
             if flags & FLAG_AUDIO:
-                self.jb.insert(seq, data[HDR.size:])
+                self.handle_audio(seq, data[HDR.size:])
+            else:
+                self.last_rx_time = time.monotonic()
+                self.rx_count += 1
 
     def _play_loop(self):
         silence = bytes(FRAME * 2)
@@ -223,7 +401,10 @@ class WalkieClient:
                 expect = (expect + 1) & 0xFFFF
                 if pkt is not None:
                     misses = 0
-                    pcm = bytes(self.dec.decode(memoryview(bytearray(pkt))))
+                    try:
+                        pcm = bytes(self.dec.decode(memoryview(bytearray(pkt))))
+                    except Exception:
+                        pcm = silence  # never let one bad packet kill playback
                     if len(pcm) != FRAME * 2:
                         pcm = silence
                 else:

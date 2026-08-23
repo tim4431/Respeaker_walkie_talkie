@@ -3,5 +3,7 @@ managed_components/
 sdkconfig
 sdkconfig.old
 dependencies.lock
-tools/zadig-*.exe
 wifi.conf
+pc_client/*.txt
+__pycache__/
+*.py[cod]

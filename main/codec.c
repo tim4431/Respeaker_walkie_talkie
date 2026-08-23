@@ -23,9 +23,10 @@ esp_err_t codec_init(void)
     /* Cap at wideband: SILK then runs at 16 kHz internally, which keeps
      * encode cost low even though we feed it 48 kHz. */
     opus_encoder_ctl(s_enc, OPUS_SET_MAX_BANDWIDTH(OPUS_BANDWIDTH_WIDEBAND));
-    /* Silence costs (almost) nothing; lost packets are recoverable from
-     * the next one. */
-    opus_encoder_ctl(s_enc, OPUS_SET_DTX(1));
+    /* DTX off: with the TCP transport bandwidth is a non-issue, and DTX
+     * proved too eager - it suppressed real speech after AGC convergence,
+     * so the far end heard nothing. Every frame is sent. */
+    opus_encoder_ctl(s_enc, OPUS_SET_DTX(0));
     opus_encoder_ctl(s_enc, OPUS_SET_INBAND_FEC(1));
     opus_encoder_ctl(s_enc, OPUS_SET_PACKET_LOSS_PERC(10));
 

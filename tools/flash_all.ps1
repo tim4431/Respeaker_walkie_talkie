@@ -41,14 +41,28 @@ function Find-DfuUtil {
 }
 
 function Get-XmosRev {
-    $dev = Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
-        Where-Object { $_.InstanceId -match 'VID_2886&PID_0019' } | Select-Object -First 1
-    if (-not $dev) { return $null }
-    $hw = (Get-PnpDeviceProperty -InstanceId $dev.InstanceId -KeyName DEVPKEY_Device_HardwareIds).Data
-    foreach ($h in $hw) {
-        if ($h -match 'REV_([0-9A-Fa-f]{4})') { return [Convert]::ToInt32($Matches[1], 16) }
+    # Only match a ReSpeaker in pure DFU mode (I2S firmware): device-level
+    # node (no &MI_ interface suffix) whose device class is DFU (Class_FE).
+    # A ReSpeaker running USB-audio firmware (e.g. used as a PC microphone)
+    # enumerates as a composite device and must never be touched.
+    $devs = Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
+        Where-Object { $_.InstanceId -match 'VID_2886&PID_0019' -and $_.InstanceId -notmatch '&MI_' }
+    foreach ($dev in $devs) {
+        $cid = (Get-PnpDeviceProperty -InstanceId $dev.InstanceId -KeyName DEVPKEY_Device_CompatibleIds -ErrorAction SilentlyContinue).Data -join ','
+        if ($cid -notmatch 'Class_FE') { continue }  # composite/audio: skip
+        $hw = (Get-PnpDeviceProperty -InstanceId $dev.InstanceId -KeyName DEVPKEY_Device_HardwareIds).Data
+        foreach ($h in $hw) {
+            if ($h -match 'REV_([0-9A-Fa-f]{4})') { return [Convert]::ToInt32($Matches[1], 16) }
+        }
     }
     return $null
+}
+
+function Test-RuntimeReSpeakerPresent([string]$DfuUtil) {
+    # A USB-audio ReSpeaker exposes a *runtime* DFU interface; dfu-util's
+    # detach/download must not run while one is connected.
+    $out = cmd /c "`"$DfuUtil`" -l 2>&1" | Out-String
+    return ($out -match 'Found Runtime')
 }
 
 function Test-DfuOpens([string]$DfuUtil) {
@@ -86,8 +100,13 @@ function Invoke-XmosFlash {
         if (-not (Test-DfuOpens $dfu)) { throw "Driver still not usable after $DriverWaitSec s - finish the Zadig install and re-run." }
         Write-Host '[XMOS] driver OK.' -ForegroundColor Green
     }
+    if (Test-RuntimeReSpeakerPresent $dfu) {
+        throw ('Another ReSpeaker in USB-audio mode is connected (e.g. a PC ' +
+               'microphone). Unplug it before XMOS flashing so the wrong ' +
+               'device cannot be targeted.')
+    }
     Write-Host '[XMOS] flashing 48k v1.1.0 (takes ~30 s)...'
-    cmd /c "`"$dfu`" -R -e -a 1 -D `"$FirmwareBin`" 2>&1" | ForEach-Object { Write-Host $_ }
+    cmd /c "`"$dfu`" -R -a 1 -D `"$FirmwareBin`" 2>&1" | ForEach-Object { Write-Host $_ }
     if ($LASTEXITCODE -ne 0) { throw "dfu-util failed with exit code $LASTEXITCODE" }
     Write-Host '[XMOS] waiting for the board to re-enumerate...'
     Start-Sleep -Seconds 5

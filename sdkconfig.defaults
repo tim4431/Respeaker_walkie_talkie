@@ -15,3 +15,9 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 
 # 1 ms tick for responsive pacing/debounce
 CONFIG_FREERTOS_HZ=1000
+
+# TCP audio transport: reconnect churn must not exhaust PCBs. Default
+# MSL 60 s parks every closed connection in TIME_WAIT for 2 min.
+CONFIG_LWIP_TCP_MSL=6000
+CONFIG_LWIP_MAX_ACTIVE_TCP=16
+CONFIG_LWIP_MAX_LISTENING_TCP=8

@@ -15,6 +15,11 @@
 /* Largest Opus payload we ever expect at <=64 kbps VBR */
 #define WT_MAX_PAYLOAD      400
 
+/* Frames batched into one datagram (latency vs packet rate); a pending
+ * batch is flushed early after this many microseconds. */
+#define WT_FRAMES_PER_PKT   3
+#define WT_BATCH_FLUSH_US   (70 * 1000)
+
 /* XIAO ESP32-S3 <-> XU316 wiring (fixed on the ReSpeaker Lite kit) */
 #define WT_PIN_I2S_BCLK     GPIO_NUM_8
 #define WT_PIN_I2S_WS       GPIO_NUM_7
