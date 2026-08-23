@@ -130,6 +130,14 @@ Each node — every walkie plus *This PC* — gets a card with:
 | `vol` | speaker volume, 0–100 % |
 | `gain` | mic gain, 0–200 % — scales the waveform, the gate and what is sent |
 | `gate` | voice-activation threshold; higher = louder speech required |
+| **AGC** | *(devices)* auto gain + noise gate; shows the live boost, e.g. `AGC ×5.8` |
+
+**Too quiet, too noisy, or both?** Turn on **AGC**. Plain `gain` multiplies
+voice and hiss equally, so it cannot fix both at once. AGC learns the room's
+noise floor, boosts only what stands above it (up to ×12, converging on a
+consistent level so quiet and loud talkers arrive alike), and ducks
+noise-only stretches by about 18 dB — with a 300 ms hold so syllable gaps
+don't chatter. It is stored on the device and survives reboots.
 
 **Tuning voice mode:** switch TX to *voice*, then watch your own waveform
 while talking — set `gate` so speech crosses the dashed line and room noise

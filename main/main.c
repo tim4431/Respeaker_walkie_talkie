@@ -17,7 +17,7 @@
 #include "console.h"
 
 static const char *TAG = "walkie";
-#define WT_BUILD_TAG "WTKI-2026-08-22-I"
+#define WT_BUILD_TAG "WTKI-2026-08-23-J"
 
 static volatile bool s_muted = false;
 static volatile uint8_t s_volume = 100;     /* speaker volume percent, 0-100 */
@@ -28,6 +28,8 @@ static volatile bool s_tx_active = false;   /* transmitting right now */
 static volatile uint8_t s_mic_level = 0;    /* latest frame peak >> 7 */
 static volatile uint8_t s_vox_thresh = WT_VOX_THRESH_DEFAULT;  /* NVS */
 static volatile uint8_t s_mic_gain = 100;   /* percent, 0-200, NVS-persisted */
+static volatile bool s_mic_agc = false;     /* auto gain + noise gate, NVS */
+static volatile uint8_t s_agc_report = 16;  /* current AGC gain, 1/16 steps */
 static volatile int64_t s_last_play_us = 0; /* last real far-end frame played */
 static nvs_handle_t s_nvs;
 static volatile uint32_t s_rx_dgrams = 0;   /* all valid datagrams */
@@ -57,31 +59,77 @@ static void capture_task(void *arg)
 
     int64_t vox_hold_until = 0;
 
+    float applied_gain = 1.0f;   /* gain the last frame ended on (ramp start) */
+    float agc = 1.0f;            /* adaptive component, speech-driven only */
+    float noise_floor = WT_NF_MIN;
+    float nf_run = 1e9f;         /* minimum seen in the current window */
+    int nf_count = 0;
+    int nr_hold = 0;             /* frames the noise gate stays open */
+
     for (;;) {
-        if (audio_capture(pcm) != ESP_OK) {
+        /* All mic conditioning is folded into one gain that audio_capture
+         * applies in the 32-bit domain and ramps across the frame, so a
+         * quiet mic can be boosted without amplifying truncation noise and
+         * gate/AGC moves never click. The level driving it is the previous
+         * frame's pre-gain peak (20 ms of lag, standard for AGC). */
+        float manual = (float)s_mic_gain / 100.0f;
+        float target = manual;
+        if (s_mic_agc) {
+            float in_peak = (float)audio_last_raw_peak() / 65536.0f;
+            /* rolling minimum -> the room's own noise floor */
+            if (in_peak < nf_run) {
+                nf_run = in_peak;
+            }
+            if (++nf_count >= WT_NF_WINDOW) {
+                noise_floor += (nf_run - noise_floor) * WT_NF_SMOOTH;
+                if (noise_floor < WT_NF_MIN) {
+                    noise_floor = WT_NF_MIN;
+                }
+                nf_run = in_peak;
+                nf_count = 0;
+            }
+            bool voiced = in_peak > noise_floor * WT_NF_SPEECH_MULT
+                                    + WT_NF_SPEECH_MARGIN;
+            nr_hold = voiced ? WT_NR_HOLD_FRAMES
+                             : (nr_hold > 0 ? nr_hold - 1 : 0);
+            if (voiced) {
+                /* converge on a consistent output level for speech */
+                float want = WT_AGC_TARGET_PEAK / (in_peak * manual + 1.0f);
+                if (want < WT_AGC_MIN) want = WT_AGC_MIN;
+                if (want > WT_AGC_MAX) want = WT_AGC_MAX;
+                float rate = (want < agc) ? WT_AGC_ATTACK : WT_AGC_RELEASE;
+                agc += (want - agc) * rate;
+            }
+            /* noise-only frames keep the adapted gain but get ducked */
+            target = manual * agc * (nr_hold > 0 ? 1.0f : WT_NR_ATTEN);
+            s_agc_report = (uint8_t)(agc * 16.0f > 255.0f ? 255 : agc * 16.0f);
+        } else {
+            agc = 1.0f;
+            noise_floor = WT_NF_MIN;
+            nf_run = 1e9f;
+            nf_count = 0;
+            nr_hold = 0;
+            s_agc_report = 16;
+        }
+        if (audio_capture(pcm, applied_gain, target) != ESP_OK) {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
-        /* digital mic gain first: level reporting, VOX and encoding all see
-         * the scaled signal, so the number matches what the UIs draw */
-        uint8_t gain = s_mic_gain;
-        if (gain != 100) {
-            int32_t q = ((int32_t)gain << 15) / 100;
-            for (int i = 0; i < WT_FRAME_SAMPLES; i++) {
-                int32_t v = ((int32_t)pcm[i] * q) >> 15;
-                if (v > 32767) v = 32767;
-                if (v < -32768) v = -32768;
-                pcm[i] = (int16_t)v;
-            }
-        }
-        /* mic health telemetry every ~2 s: peak of converted samples, peak of
-         * raw 32-bit slot, and how many frames actually went out */
-        int16_t fpeak = 0;  /* this frame's peak drives the VOX gate */
+        applied_gain = target;
+        /* Gate decisions use the input level (this frame's pre-gain peak,
+         * scaled by manual gain only) - NOT the output. Reading back the
+         * ducked output would be a trap: once the noise gate closed, the
+         * first word would arrive attenuated, stay under the threshold, and
+         * the gate could never reopen. It is also the level the UI's gate
+         * line is drawn against, so "bars above the line" stays truthful. */
+        float in_level = ((float)audio_last_raw_peak() / 65536.0f) * manual;
+        int16_t fpeak = in_level > 32767.0f ? 32767 : (int16_t)in_level;
+        int16_t opeak = 0;  /* what actually goes out, for the log */
         for (int i = 0; i < WT_FRAME_SAMPLES; i++) {
             int16_t a = pcm[i] < 0 ? -pcm[i] : pcm[i];
-            if (a > fpeak) fpeak = a;
+            if (a > opeak) opeak = a;
         }
-        if (fpeak > peak) peak = fpeak;
+        if (opeak > peak) peak = opeak;
         s_mic_level = (uint8_t)(fpeak >> 7);  /* live level for UIs */
         int32_t rp = audio_last_raw_peak();
         if (rp > raw_peak) raw_peak = rp;
@@ -196,6 +244,8 @@ static bool send_status_reply(const struct sockaddr_in *dst)
     st->mic_level = s_mic_level;
     st->vox_thresh = s_vox_thresh;
     st->mic_gain = s_mic_gain;
+    st->mic_agc = s_mic_agc ? 1 : 0;
+    st->agc_gain = s_agc_report;
     if (s_tcp_fd >= 0) {  /* a TCP call counts as linked */
         st->linked = 1;
     }
@@ -296,6 +346,18 @@ static void rx_task(void *arg)
                         nvs_commit(s_nvs);
                     }
                     ESP_LOGI(TAG, "mic gain set to %u%%", (unsigned)gv);
+                }
+                send_status_reply(&src);
+            } else if (cmd == WT_CTRL_SET_AGC && payload >= 2) {
+                bool on = buf[sizeof(wt_header_t) + 1] != 0;
+                if (on != s_mic_agc) {
+                    s_mic_agc = on;
+                    if (s_nvs) {
+                        nvs_set_u8(s_nvs, "mic_agc", on ? 1 : 0);
+                        nvs_commit(s_nvs);
+                    }
+                    ESP_LOGI(TAG, "auto gain + noise gate %s",
+                             on ? "on" : "off");
                 }
                 send_status_reply(&src);
             } else if (cmd == WT_CTRL_SET_MUTE && payload >= 2) {
@@ -584,6 +646,10 @@ static void settings_nvs_load(void)
     if (nvs_get_u8(s_nvs, "mic_gain", &v) == ESP_OK && v <= 200) {
         s_mic_gain = v;
         ESP_LOGI(TAG, "mic gain restored: %u%%", (unsigned)v);
+    }
+    if (nvs_get_u8(s_nvs, "mic_agc", &v) == ESP_OK) {
+        s_mic_agc = v != 0;
+        ESP_LOGI(TAG, "auto gain restored: %s", s_mic_agc ? "on" : "off");
     }
 }
 

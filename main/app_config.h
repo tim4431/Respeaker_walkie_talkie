@@ -53,3 +53,31 @@
 /* Group audio: one active speaker at a time - a UDP source owns playback
  * until it has been silent this long, then another source may take over. */
 #define WT_SPK_LOCK_US      (400 * 1000)
+
+/* Auto gain + noise gate (WT_CTRL_SET_AGC). Plain digital gain raises voice
+ * and hiss equally, so instead: learn the room's noise floor, boost only
+ * what stands above it, and duck the rest. Deliberately independent of the
+ * VOX transmit threshold - tying them together meant a quiet room gated the
+ * AGC off entirely, so quiet speech could never be brought up. Levels are
+ * frame peaks in int16 units, measured before gain. */
+#define WT_AGC_TARGET_PEAK  20000.0f  /* aim speech peaks just under clipping */
+#define WT_AGC_MAX          12.0f
+#define WT_AGC_MIN          0.5f
+#define WT_AGC_ATTACK       0.30f     /* too loud: come down quickly */
+#define WT_AGC_RELEASE      0.04f     /* too quiet: creep up, never pump */
+#define WT_NR_ATTEN         0.12f     /* ~-18 dB duck for noise-only frames */
+
+/* Noise floor by minimum statistics: the quietest frame in each window sets
+ * it. Deliberately NOT driven by the speech decision - feeding that back
+ * deadlocks (a closed gate keeps speech quiet, so it never reopens; a frozen
+ * floor lets steady room tone read as speech forever). A rolling minimum
+ * needs no classification: steady noise sets the floor, speech does not,
+ * because it dips between syllables. */
+#define WT_NF_WINDOW        75        /* frames per window (1.5 s) */
+#define WT_NF_SMOOTH        0.5f
+#define WT_NF_MIN           20.0f
+/* Speech must stand this far above the floor to count (x mult + abs margin). */
+#define WT_NF_SPEECH_MULT   3.0f
+#define WT_NF_SPEECH_MARGIN 60.0f
+/* Hold the gate open after the last voiced frame, or syllable gaps chatter. */
+#define WT_NR_HOLD_FRAMES   15        /* 300 ms */

@@ -43,6 +43,7 @@ CTRL_SET_MUTE = 0x06
 CTRL_SET_GROUP = 0x07
 CTRL_SET_THRESH = 0x08
 CTRL_SET_GAIN = 0x09
+CTRL_SET_AGC = 0x0A
 STATUS = struct.Struct("<BBBBBbHI24s")   # wt_status_t base (36 B); the
 MEMBER = struct.Struct("<IH")            # extension fields are optional
 
@@ -208,7 +209,8 @@ class Monitor:
             "muted": muted, "linked": linked, "locked": locked,
             "rssi": rssi, "volume": None, "tx_mode": None,
             "tx_active": 0, "rx_active": 0, "members": [], "mic_level": 0,
-            "vox_thresh": None, "mic_gain": None,
+            "vox_thresh": None, "mic_gain": None, "mic_agc": None,
+            "agc_gain": None,
         }
         off = STATUS.size
         for i, n in enumerate(("volume", "tx_mode", "tx_active", "rx_active")):
@@ -231,6 +233,10 @@ class Monitor:
             st["vox_thresh"] = body[lvl_off + 1]
         if len(body) > lvl_off + 2:
             st["mic_gain"] = body[lvl_off + 2]
+        if len(body) > lvl_off + 3:
+            st["mic_agc"] = body[lvl_off + 3]
+        if len(body) > lvl_off + 4:
+            st["agc_gain"] = body[lvl_off + 4] / 16.0
         host_s = host.split(b"\0")[0].decode(errors="replace")
         return host_s, st
 
@@ -301,6 +307,9 @@ class Monitor:
     def set_gain(self, ip, port, gain):
         self._ctrl(ip, port, struct.pack("<BB", CTRL_SET_GAIN,
                                          max(0, min(200, int(gain)))))
+
+    def set_agc(self, ip, port, on):
+        self._ctrl(ip, port, struct.pack("<BB", CTRL_SET_AGC, 1 if on else 0))
 
     def set_group(self, ip, port, members):
         body = struct.pack("<BB", CTRL_SET_GROUP, len(members))
@@ -1159,12 +1168,16 @@ class App:
         b_mode = flat_btn(btns, "TX: always",
                           lambda i=n["id"]: self.toggle_mode(i), small=True)
         b_mode.pack(side="left", padx=4)
-        b_call = None
+        b_call = b_agc = None
         if not n["is_pc"]:
             b_call = flat_btn(btns, "Call",
                               lambda i=n["id"]: self.toggle_talk(i),
                               small=True)
             b_call.pack(side="left")
+            # device-side only: the ESP32 runs the adaptive gain / noise gate
+            b_agc = flat_btn(btns, "AGC",
+                             lambda i=n["id"]: self.toggle_agc(i), small=True)
+            b_agc.pack(side="left", padx=(4, 0))
 
         def bar_row(label, color, on_change, on_final, vmax=100):
             row = tk.Frame(f, bg=CARD2)
@@ -1200,7 +1213,7 @@ class App:
 
         cardw = {"frame": f, "dot": dot, "oid": oid, "name": name,
                  "badge": badge, "wave": wave, "sub": sub, "mute": b_mute,
-                 "mode": b_mode, "call": b_call,
+                 "mode": b_mode, "call": b_call, "agc": b_agc,
                  "vol": vol, "vol_pct": vol_pct, "vol_init": False,
                  "gain": gain, "gain_pct": gain_pct, "gain_init": False,
                  "sens": sens, "sens_pct": sens_pct, "sens_init": False,
@@ -1234,6 +1247,13 @@ class App:
         cw["mode"].config(text="TX: voice" if vox else "TX: always",
                           bg=BTN_ON if vox else BTN_BG,
                           fg="#ffffff" if vox else FG)
+        if cw["agc"] is not None:
+            on = bool(st.get("mic_agc"))
+            live = st.get("agc_gain")
+            cw["agc"].config(
+                text=f"AGC ×{live:.1f}" if (on and live) else "AGC",
+                bg=BTN_ON if on else BTN_BG,
+                fg="#ffffff" if on else FG)
         if cw["call"] is not None:
             in_call = self.client and self.talk_ip == n["id"]
             cw["call"].config(text="End" if in_call else "Call",
@@ -1325,6 +1345,13 @@ class App:
                 if dev:
                     self.monitor.set_volume(nid, dev.get("port", PORT),
                                             value)
+
+    def toggle_agc(self, nid):
+        dev = self.monitor.snapshot().get(nid)
+        if dev:
+            st = dev.get("status") or {}
+            self.monitor.set_agc(nid, dev.get("port", PORT),
+                                 not st.get("mic_agc"))
 
     def _on_card_gain(self, nid, value, final):
         value = int(value)

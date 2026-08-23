@@ -46,7 +46,7 @@ esp_err_t audio_init(void)
     return ESP_OK;
 }
 
-esp_err_t audio_capture(int16_t *mono)
+esp_err_t audio_capture(int16_t *mono, float g0, float g1)
 {
     size_t want = sizeof(s_rx_raw);
     size_t got = 0;
@@ -59,13 +59,26 @@ esp_err_t audio_capture(int16_t *mono)
         }
         got += n;
     }
-    /* Channel 0 = processed mic; samples are MSB-aligned in the 32-bit slot. */
+    /* Channel 0 = processed mic; samples are MSB-aligned in the 32-bit slot.
+     * Scale in the 32-bit domain: 1/65536 is the plain int16 conversion, so
+     * a gain of g lands at g * the old value but keeps the bits that used
+     * to be truncated away. s_raw_peak stays pre-gain, so callers can judge
+     * the true input level however loud they have driven the output. */
     int32_t rp = 0;
+    const float step = (g1 - g0) / (float)WT_FRAME_SAMPLES;
+    float g = g0;
     for (int i = 0; i < WT_FRAME_SAMPLES; i++) {
         int32_t raw = s_rx_raw[2 * i];
         int32_t a = raw < 0 ? -raw : raw;
         if (a > rp) rp = a;
-        mono[i] = (int16_t)(raw >> 16);
+        float v = (float)raw * (g * (1.0f / 65536.0f));
+        g += step;
+        if (v > 32767.0f) {
+            v = 32767.0f;
+        } else if (v < -32768.0f) {
+            v = -32768.0f;
+        }
+        mono[i] = (int16_t)v;
     }
     s_raw_peak = rp;
     return ESP_OK;

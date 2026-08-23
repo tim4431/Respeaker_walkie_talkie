@@ -47,6 +47,9 @@ typedef struct __attribute__((packed)) {
 #define WT_CTRL_SET_GAIN   0x09  /* body: u8 mic gain percent 0-200 (digital,
                                     saturating; scales the captured signal
                                     before level/VOX/encode). Persisted. */
+#define WT_CTRL_SET_AGC    0x0A  /* body: u8 0/1 - auto gain + noise gate:
+                                    adapts gain on speech only and ducks
+                                    everything below the gate. Persisted. */
 
 #define WT_TXMODE_ALWAYS 0  /* transmit continuously */
 #define WT_TXMODE_VOX    1  /* transmit only on local speech while the far
@@ -80,6 +83,8 @@ typedef struct __attribute__((packed)) {
     uint8_t  mic_level;  /* latest 20 ms mic frame peak, peak16 >> 7 */
     uint8_t  vox_thresh; /* VOX TX threshold 0-100 (WT_CTRL_SET_THRESH) */
     uint8_t  mic_gain;   /* mic gain percent 0-200 (see WT_CTRL_SET_GAIN) */
+    uint8_t  mic_agc;    /* auto gain + noise gate on (WT_CTRL_SET_AGC) */
+    uint8_t  agc_gain;   /* gain the AGC currently applies, in 1/16 steps */
 } wt_status_t;
 
 typedef struct __attribute__((packed)) {

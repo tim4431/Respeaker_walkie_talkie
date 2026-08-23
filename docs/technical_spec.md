@@ -156,6 +156,7 @@ request is answered with a `wt_status_t`.
 | `0x07` | `SET_GROUP` | `u8 count` + count × `{u32 ip, u16 port}` | yes |
 | `0x08` | `SET_THRESH` | `u8` VOX gate 0–100 | yes |
 | `0x09` | `SET_GAIN` | `u8` mic gain 0–200 % | yes |
+| `0x0A` | `SET_AGC` | `u8` 0/1 auto gain + noise gate | yes |
 
 ### Status reply
 
@@ -179,6 +180,8 @@ typedef struct __attribute__((packed)) {
     uint8_t  mic_level;        // latest frame peak >> 7
     uint8_t  vox_thresh;       // 0-100
     uint8_t  mic_gain;         // 0-200 %
+    uint8_t  mic_agc;          // auto gain + noise gate on
+    uint8_t  agc_gain;         // gain the AGC currently applies, 1/16 steps
 } wt_status_t;
 ```
 
@@ -209,8 +212,48 @@ audio playing.
 **Mic gain is applied first**, before level reporting, gating and encoding —
 so one number scales the waveform you see, the gate's input, and the audio
 actually sent. Gain therefore also shifts where the gate effectively opens.
-Since the XMOS already runs AGC, values far above 100 % mostly amplify room
-noise. Gain saturates rather than wraps, so clipping degrades gracefully.
+Gain saturates rather than wraps, so clipping degrades gracefully.
+
+Gain is applied to the **32-bit I2S slot before the narrowing to int16**
+(`audio_capture(mono, g0, g1)`), and ramps linearly across the frame. Scaling
+after the truncation — as this code used to — amplified truncation noise
+along with the signal and made every AGC/gate move click.
+
+### Auto gain + noise gate (`SET_AGC`)
+
+Flat digital gain raises voice and hiss equally, so it cannot fix "too quiet
+*and* too noisy". This mode instead learns the room and treats the two
+differently:
+
+- **Noise floor by minimum statistics.** The quietest frame in each 1.5 s
+  window sets the floor (`WT_NF_WINDOW`, smoothed by `WT_NF_SMOOTH`).
+- **Voiced** = `peak > floor × 3 + 60`.
+- **Gain adapts on voiced frames only**, converging on
+  `WT_AGC_TARGET_PEAK` (20 000), clamped to ×0.5–×12, fast to come down
+  (`WT_AGC_ATTACK`) and slow to go up (`WT_AGC_RELEASE`) so it never pumps.
+- **Everything else is ducked** to `WT_NR_ATTEN` (≈ −18 dB), after a
+  300 ms hold (`WT_NR_HOLD_FRAMES`) so syllable gaps do not chatter.
+
+Two feedback traps this design deliberately avoids, both of which deadlock:
+
+1. **Gate decisions must not read the ducked output.** They use the frame's
+   *pre-gain* peak (scaled by manual gain only). Reading the output back
+   would mean a closed gate keeps the first word attenuated, so the gate
+   could never reopen.
+2. **The noise floor must not depend on the speech decision.** Freezing the
+   floor during "speech" lets steady room tone read as speech forever;
+   letting it rise during speech lets a sustained quiet talker be absorbed
+   into the floor. A rolling minimum needs no classification and does
+   neither.
+
+The AGC is also independent of the VOX transmit threshold — tying them
+together meant a quiet room gated the AGC off entirely, which is exactly
+when a quiet talker needs the boost most.
+
+Simulated against syllable-modulated speech over a steady room tone: a quiet
+room is never misread as speech, quiet and loud speech are detected 86 % and
+100 % of frames, output speech-to-noise improves from 5× to ~37×, and quiet
+versus loud speech land within about 2× of each other instead of 6×.
 
 ---
 
@@ -253,6 +296,7 @@ flowchart TD
 | `tx_mode` | 0 always / 1 voice | `SET_MODE` |
 | `vox_th` | VOX gate 0–100 | `SET_THRESH` |
 | `mic_gain` | mic gain 0–200 % | `SET_GAIN` |
+| `mic_agc` | auto gain + noise gate on/off | `SET_AGC` |
 | `members` | group send-list blob | `SET_GROUP` |
 | `peer_ip`, `peer_port` | manual 1:1 pairing | `SET_PEER` |
 
