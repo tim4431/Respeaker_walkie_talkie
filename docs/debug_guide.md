@@ -31,11 +31,15 @@ registers the monitor socket's addr in each device's member list and runs
 a `WalkieClient(targets=[...], use_tcp=False)` on the shared socket.
 
 Control on UDP 5004 with `WT_FLAG_CTRL`: `SET_VOL` (0x04, volume 0–100,
-NVS), `SET_MODE` (0x05, 0 = always transmit, 1 = VOX/voice-activated, NVS),
+NVS), `SET_MODE` (0x05, 0 = always transmit, 1 = voice/VAD, 2 = plain level
+gate, NVS),
 `SET_MUTE` (0x06, not persisted), `SET_GROUP` (0x07), `SET_THRESH` (0x08, VOX
 TX threshold 0–100, NVS; higher = louder speech needed, mapped quadratically
-onto peak16 by `WT_VOX_PEAK_OF`: `150 + thresh² * 2`, default 30 ≈ peak
-1950), `SET_GAIN` (0x09, mic gain 0–200 %, NVS; saturating digital gain
+onto peak16 by `WT_VOX_PEAK_OF`: `150 + thresh² * 2`, default 15 ≈ peak 600.
+On-device the threshold is only an energy floor AND'ed with the WebRTC VAD
+(`components/libfvad`) — the VAD decides speech vs non-speech; units flashed
+before the VAD change keep their old NVS value, typically 30),
+`SET_GAIN` (0x09, mic gain 0–200 %, NVS; saturating digital gain
 applied to captured samples before level/VOX/encode — so gain also shifts
 where the gate opens), plus status/peer as before. Control never affects peer
 adoption. Every ctrl request is answered with `wt_status_t`, which appends

@@ -75,6 +75,13 @@ COLORS = {
 
 FONT = "Segoe UI"
 
+# Button icons. Emoji are non-BMP characters, which Tk renders correctly
+# from 8.6.12 on (Windows); main() swaps in the plain-text set on older Tk.
+ICONS = {"mic": "🎤", "mic_off": "🎤✕", "spk": "🔊", "spk_off": "🔇",
+         "call": "📞 Call", "end": "✕ End"}
+ICONS_TEXT = {"mic": "Mic", "mic_off": "Mic ✕", "spk": "Spk",
+              "spk_off": "Spk ✕", "call": "Call", "end": "End"}
+
 
 def load_settings():
     try:
@@ -294,8 +301,10 @@ class Monitor:
         self._ctrl(ip, port, struct.pack("<BB", CTRL_SET_VOL,
                                          max(0, min(100, int(volume)))))
 
-    def set_mode(self, ip, port, vox):
-        self._ctrl(ip, port, struct.pack("<BB", CTRL_SET_MODE, 1 if vox else 0))
+    def set_mode(self, ip, port, mode):
+        """mode: 0 always, 1 voice (VAD), 2 plain level gate."""
+        self._ctrl(ip, port, struct.pack("<BB", CTRL_SET_MODE,
+                                         max(0, min(2, int(mode)))))
 
     def set_mute(self, ip, port, muted):
         self._ctrl(ip, port, struct.pack("<BB", CTRL_SET_MUTE, 1 if muted else 0))
@@ -356,8 +365,11 @@ class MiniWave:
 
     def __init__(self, parent, color, height=40):
         self.h = height
-        self.canvas = tk.Canvas(parent, height=height, bg="#f4f6fb",
-                                highlightthickness=1,
+        # explicit width: a Canvas defaults to 10 *centimeters*, which on a
+        # high-DPI screen is ~760 px and blew every card up so wide that the
+        # neighbours (and their buttons) fell off the window edge
+        self.canvas = tk.Canvas(parent, height=height, width=236,
+                                bg="#f4f6fb", highlightthickness=1,
                                 highlightbackground=BORDER)
         self.levels = deque([0.0] * self.BARS, maxlen=self.BARS)
         self.color = color
@@ -1015,6 +1027,8 @@ class App:
         self.groups = self.settings.get("groups", [])  # [{name, members}]
         self.tx_mode = self.settings.get("mode", "full")
         self.pc_muted = False
+        self.pc_spk_muted = False   # PC speaker mute (not persisted)
+        self._spk_prev = {}         # device ip -> volume to restore on unmute
         self.cards = {}             # node id -> card widget dict
         self.group_boxes = []       # [{frame, ...}] parallel to self.groups
         self._groups_sig = None
@@ -1026,8 +1040,14 @@ class App:
 
         root.title("Walkie Group")
         root.configure(bg=BG)
-        root.geometry("1040x620+80+40")
-        root.minsize(900, 560)
+        # Tk scales fonts by DPI but our pixel geometry was tuned for 96 dpi;
+        # scale the default window (clamped to the screen) so the node cards
+        # don't run off the right edge on a high-DPI display.
+        scale = max(1.0, root.winfo_fpixels("1i") / 96.0)
+        w = min(int(1040 * scale), root.winfo_screenwidth() - 80)
+        h = min(int(620 * scale), root.winfo_screenheight() - 120)
+        root.geometry(f"{w}x{h}+40+40")
+        root.minsize(min(int(900 * scale), w), min(int(560 * scale), h))
 
         self._build_header()
         self._build_cards_panel()
@@ -1114,8 +1134,9 @@ class App:
             state = state_of(dev)
             if self.client and ip == self.talk_ip and state == "offline":
                 state = "linked"
-            sub = (f"{st.get('rssi', '?')} dBm · "
-                   f"tx {'voice' if st.get('tx_mode') else 'always'}"
+            mode_name = {0: "always", 1: "voice", 2: "gate"}.get(
+                st.get("tx_mode") or 0, "?")
+            sub = (f"{st.get('rssi', '?')} dBm · tx {mode_name}"
                    if fresh else "offline")
             out.append({
                 "id": ip, "key": dev.get("name", ip),
@@ -1162,15 +1183,35 @@ class App:
 
         btns = tk.Frame(f, bg=CARD2)
         btns.pack(fill="x", padx=8, pady=(2, 0))
-        b_mute = flat_btn(btns, "Mute", lambda i=n["id"]: self.toggle_mute(i),
-                          small=True)
+        b_mute = flat_btn(btns, ICONS["mic"],
+                          lambda i=n["id"]: self.toggle_mute(i), small=True)
         b_mute.pack(side="left")
-        b_mode = flat_btn(btns, "TX: always",
-                          lambda i=n["id"]: self.toggle_mode(i), small=True)
-        b_mode.pack(side="left", padx=4)
+        b_spk = flat_btn(btns, ICONS["spk"],
+                         lambda i=n["id"]: self.toggle_spk_mute(i), small=True)
+        b_spk.pack(side="left", padx=(4, 0))
+        # TX mode as a segmented setting (the active segment is filled): a
+        # single "VOX on/off" chip read as a status badge, not a control.
+        # Devices offer voice (VAD) and gate (plain level threshold); the PC
+        # has no VAD, so its only gated mode IS the level gate.
+        tk.Label(btns, text="tx", fg=DIM, bg=CARD2,
+                 font=(FONT, 8)).pack(side="left", padx=(6, 1))
+        b_always = flat_btn(btns, "always",
+                            lambda i=n["id"]: self.set_tx_mode(i, 0),
+                            small=True)
+        b_always.pack(side="left")
+        b_voice = None
+        if not n["is_pc"]:
+            b_voice = flat_btn(btns, "voice",
+                               lambda i=n["id"]: self.set_tx_mode(i, 1),
+                               small=True)
+            b_voice.pack(side="left", padx=(1, 0))
+        b_gate = flat_btn(btns, "gate",
+                          lambda i=n["id"]: self.set_tx_mode(i, 2),
+                          small=True)
+        b_gate.pack(side="left", padx=(1, 4))
         b_call = b_agc = None
         if not n["is_pc"]:
-            b_call = flat_btn(btns, "Call",
+            b_call = flat_btn(btns, ICONS["call"],
                               lambda i=n["id"]: self.toggle_talk(i),
                               small=True)
             b_call.pack(side="left")
@@ -1213,7 +1254,8 @@ class App:
 
         cardw = {"frame": f, "dot": dot, "oid": oid, "name": name,
                  "badge": badge, "wave": wave, "sub": sub, "mute": b_mute,
-                 "mode": b_mode, "call": b_call, "agc": b_agc,
+                 "spk": b_spk, "mode_always": b_always, "mode_voice": b_voice,
+                 "mode_gate": b_gate, "call": b_call, "agc": b_agc,
                  "vol": vol, "vol_pct": vol_pct, "vol_init": False,
                  "gain": gain, "gain_pct": gain_pct, "gain_init": False,
                  "sens": sens, "sens_pct": sens_pct, "sens_init": False,
@@ -1238,15 +1280,26 @@ class App:
             cw["badge"].config(text="HEARING", bg=RX_COLOR)
         else:
             cw["badge"].config(text="", bg=CARD2)
-        cw["mute"].config(text="Unmute" if n["muted"] else "Mute")
+        st = (n["dev"] or {}).get("status") or {}
+        cw["mute"].config(text=ICONS["mic_off"] if n["muted"] else ICONS["mic"],
+                          bg=COLORS["muted"] if n["muted"] else BTN_BG,
+                          fg="#ffffff" if n["muted"] else FG)
         if n["is_pc"]:
-            vox = self.tx_mode == "vox"
+            mode = 2 if self.tx_mode == "vox" else 0
+            spk_muted = self.pc_spk_muted
         else:
-            st = (n["dev"] or {}).get("status") or {}
-            vox = bool(st.get("tx_mode"))
-        cw["mode"].config(text="TX: voice" if vox else "TX: always",
-                          bg=BTN_ON if vox else BTN_BG,
-                          fg="#ffffff" if vox else FG)
+            mode = int(st.get("tx_mode") or 0)
+            spk_muted = st.get("volume") == 0
+        cw["spk"].config(text=ICONS["spk_off"] if spk_muted else ICONS["spk"],
+                         bg=COLORS["muted"] if spk_muted else BTN_BG,
+                         fg="#ffffff" if spk_muted else FG)
+        for m, key in ((0, "mode_always"), (1, "mode_voice"),
+                       (2, "mode_gate")):
+            b = cw.get(key)
+            if b is not None:
+                on = mode == m
+                b.config(bg=BTN_ON if on else BTN_BG,
+                         fg="#ffffff" if on else FG)
         if cw["agc"] is not None:
             on = bool(st.get("mic_agc"))
             live = st.get("agc_gain")
@@ -1256,14 +1309,13 @@ class App:
                 fg="#ffffff" if on else FG)
         if cw["call"] is not None:
             in_call = self.client and self.talk_ip == n["id"]
-            cw["call"].config(text="End" if in_call else "Call",
+            cw["call"].config(text=ICONS["end"] if in_call else ICONS["call"],
                               bg=TX_COLOR if in_call else BTN_BG,
                               fg="#ffffff" if in_call else FG,
                               state="disabled" if (self.group_client and
                                                    not in_call)
                               else "normal")
         # sliders reflect the node's stored values until the user touches them
-        st = (n["dev"] or {}).get("status") or {}
         if n["is_pc"]:
             vol_val = min(100, int(self.settings.get("pc_vol", 100)))
             sens_val = int(self.settings.get("pc_thresh", 30))
@@ -1310,9 +1362,43 @@ class App:
                 self.monitor.set_mute(nid, dev.get("port", PORT),
                                       not st.get("muted"))
 
-    def toggle_mode(self, nid):
+    def toggle_spk_mute(self, nid):
+        """Speaker mute. The PC's is a local flag over its playback volume;
+        a device's is volume 0 on the device itself (so it also persists and
+        works with the GUI closed), restored to the pre-mute value."""
         if nid == "pc":
-            self.tx_mode = "vox" if self.tx_mode == "full" else "full"
+            self.pc_spk_muted = not self.pc_spk_muted
+            vol = 0 if self.pc_spk_muted else \
+                min(100, int(self.settings.get("pc_vol", 100)))
+            for c in (self.client, self.group_client):
+                if c:
+                    c.rx_volume = vol / 100.0
+            new = vol
+        else:
+            dev = self.monitor.snapshot().get(nid)
+            if not dev:
+                return
+            st = dev.get("status") or {}
+            vol = st.get("volume")
+            if vol is None:
+                return  # status too old to know what to restore
+            if vol > 0:
+                self._spk_prev[nid] = vol
+                new = 0
+            else:
+                new = self._spk_prev.get(nid, 100)
+            self.monitor.set_volume(nid, dev.get("port", PORT), new)
+        cw = self.cards.get(nid)
+        if cw:
+            cw["vol_init"] = True
+            cw["vol"].set(new)
+            cw["vol_pct"].config(text=f"{new}%")
+
+    def set_tx_mode(self, nid, mode):
+        """mode: 0 always, 1 voice (device VAD), 2 level gate. The PC only
+        distinguishes always/gated - its gated mode is the RMS gate."""
+        if nid == "pc":
+            self.tx_mode = "vox" if mode else "full"
             for c in (self.client, self.group_client):
                 if c:
                     c.mode = self.tx_mode
@@ -1321,9 +1407,7 @@ class App:
         else:
             dev = self.monitor.snapshot().get(nid)
             if dev:
-                st = dev.get("status") or {}
-                self.monitor.set_mode(nid, dev.get("port", PORT),
-                                      not st.get("tx_mode"))
+                self.monitor.set_mode(nid, dev.get("port", PORT), mode)
 
     def _on_card_vol(self, nid, value, final):
         value = int(value)
@@ -1332,6 +1416,7 @@ class App:
             cw["vol_init"] = True   # user owns the slider now
             cw["vol_pct"].config(text=f"{value}%")
         if nid == "pc":
+            self.pc_spk_muted = False   # touching the slider unmutes
             self.settings["pc_vol"] = value
             save_settings(self.settings)
             for c in (self.client, self.group_client):
@@ -1413,7 +1498,8 @@ class App:
         self.talk_ip = ip
 
     def _apply_pc_client_prefs(self, c):
-        c.rx_volume = min(100, int(self.settings.get("pc_vol", 100))) / 100.0
+        c.rx_volume = 0.0 if self.pc_spk_muted else \
+            min(100, int(self.settings.get("pc_vol", 100))) / 100.0
         c.vox_thresh = int(self.settings.get("pc_thresh", 30))
         c.tx_gain = int(self.settings.get("pc_gain", 100)) / 100.0
         c.mode = self.tx_mode
@@ -1829,6 +1915,13 @@ class App:
 def main():
     print("creating window...")
     root = tk.Tk()
+    try:
+        patch = tuple(int(x) for x in
+                      str(root.tk.call("info", "patchlevel")).split("."))
+    except (ValueError, tk.TclError):
+        patch = (0,)
+    if patch < (8, 6, 12):
+        ICONS.update(ICONS_TEXT)  # emoji would render as garbage boxes
     app = App(root)
     try:
         root.mainloop()
