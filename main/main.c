@@ -15,9 +15,16 @@
 #include "net.h"
 #include "led.h"
 #include "console.h"
+#include "fvad.h"
 
 static const char *TAG = "walkie";
-#define WT_BUILD_TAG "WTKI-2026-08-23-J"
+#define WT_BUILD_TAG "WTKI-2026-08-23-O"
+
+static const char *txmode_name(uint8_t m)
+{
+    return m == WT_TXMODE_VOX  ? "voice" :
+           m == WT_TXMODE_GATE ? "gate"  : "always";
+}
 
 static volatile bool s_muted = false;
 static volatile uint8_t s_volume = 100;     /* speaker volume percent, 0-100 */
@@ -42,22 +49,98 @@ static bool tcp_send_frame(const uint8_t *data, int n);
 
 /* ---------------- capture -> encode -> UDP ---------------- */
 
+/* Pending UDP batch of consecutive encoded frames (capture_task only).
+ * Frames get their seq at send time, so a VOX gap costs no seq numbers and
+ * the receiver never mistakes gate-closed silence for packet loss. */
+static struct {
+    uint8_t pkt[sizeof(wt_header_t) + WT_MAX_BATCH * (2 + WT_MAX_PAYLOAD)];
+    size_t len;
+    int cnt;
+    uint16_t first_seq;
+    int64_t t0;
+} s_batch = { .len = sizeof(wt_header_t) };
+
+static void batch_drop(void)
+{
+    s_batch.cnt = 0;
+    s_batch.len = sizeof(wt_header_t);
+}
+
+static void batch_flush(int *sent)
+{
+    if (s_batch.cnt == 0) {
+        return;
+    }
+    wt_header_t hdr = {
+        .magic = WT_MAGIC,
+        .seq = s_batch.first_seq,
+        .flags = WT_FLAG_AUDIO,
+        .version = WT_PROTO_VERSION,
+    };
+    memcpy(s_batch.pkt, &hdr, sizeof(hdr));
+    net_send_all(s_batch.pkt, s_batch.len);
+    *sent += s_batch.cnt;
+    batch_drop();
+}
+
+static void batch_add(const uint8_t *frame, int n, uint16_t *seq, int *sent)
+{
+    if (s_batch.cnt == 0) {
+        s_batch.first_seq = *seq;
+        s_batch.t0 = esp_timer_get_time();
+    }
+    s_batch.pkt[s_batch.len] = (uint8_t)(n & 0xFF);
+    s_batch.pkt[s_batch.len + 1] = (uint8_t)(n >> 8);
+    memcpy(s_batch.pkt + s_batch.len + 2, frame, n);
+    s_batch.len += 2 + n;
+    s_batch.cnt++;
+    (*seq)++;
+    if (s_batch.cnt >= WT_FRAMES_PER_PKT) {
+        batch_flush(sent);
+    }
+}
+
 static void capture_task(void *arg)
 {
     static int16_t pcm[WT_FRAME_SAMPLES];
     static uint8_t enc_buf[WT_MAX_PAYLOAD];
-    static uint8_t pkt[sizeof(wt_header_t) + WT_MAX_BATCH * (2 + WT_MAX_PAYLOAD)];
+    /* pre-roll ring: the newest WT_VOX_PREROLL encoded frames, kept while
+     * the VOX gate is closed and sent first when it opens, so the word that
+     * triggered the VAD arrives with its onset intact */
+    static uint8_t pre_buf[WT_VOX_PREROLL][WT_MAX_PAYLOAD];
+    static uint16_t pre_len[WT_VOX_PREROLL];
+    int pre_head = 0, pre_cnt = 0;
     uint16_t seq = 0;
     int frames = 0, sent = 0, enc_max = 0;
     int16_t peak = 0;
     int32_t raw_peak = 0;
-    /* pending batch of consecutive encoded frames */
-    size_t batch_len = sizeof(wt_header_t);
-    int batch_cnt = 0;
-    uint16_t batch_seq = 0;
-    int64_t batch_t0 = 0;
 
     int64_t vox_hold_until = 0;
+    int vox_run = 0;            /* consecutive frames of confirmed speech */
+    bool vox_gate_prev = false; /* transition logging only */
+    /* Adaptive ambient floor for VOX (minimum statistics, same scheme as
+     * the AGC's): the XMOS mic AGC pumps room noise up after speech ends,
+     * so a fixed floor set in a quiet moment ends up underneath the
+     * post-speech noise (measured: ambient peaks 1200-1600 vs a 950 floor).
+     * A rolling minimum tracks that breathing; speech cannot fake it
+     * because it dips between syllables. Runs in fpeak units. */
+    float vox_nf = 300.0f;
+    float vox_nf_run = 1e9f;
+    int vox_nf_cnt = 0;
+    bool prev_speech = true;    /* VAD verdict on the previous frame */
+
+    /* WebRTC VAD (libfvad): fixed-point GMM speech classifier that takes
+     * our 20 ms 48 kHz frames directly. On alloc failure VOX degrades to
+     * the old peak-only gate. */
+    Fvad *vad = fvad_new();
+    if (vad != NULL && (fvad_set_sample_rate(vad, WT_SAMPLE_RATE) < 0 ||
+                        fvad_set_mode(vad, WT_VAD_MODE) < 0)) {
+        fvad_free(vad);
+        vad = NULL;
+    }
+    if (vad == NULL) {
+        ESP_LOGW(TAG, "fvad unavailable; VOX falls back to the peak gate");
+    }
 
     float applied_gain = 1.0f;   /* gain the last frame ended on (ramp start) */
     float agc = 1.0f;            /* adaptive component, speech-driven only */
@@ -88,11 +171,17 @@ static void capture_task(void *arg)
                 nf_run = in_peak;
                 nf_count = 0;
             }
-            bool voiced = in_peak > noise_floor * WT_NF_SPEECH_MULT
-                                    + WT_NF_SPEECH_MARGIN;
-            nr_hold = voiced ? WT_NR_HOLD_FRAMES
-                             : (nr_hold > 0 ? nr_hold - 1 : 0);
-            if (voiced) {
+            bool loud = in_peak > noise_floor * WT_NF_SPEECH_MULT
+                                  + WT_NF_SPEECH_MARGIN;
+            /* The duck stays energy-based (a VAD miss must never mute a
+             * word), but gain ADAPTATION also requires the VAD's verdict on
+             * the same (previous) frame: the XMOS mic AGC pumps room noise
+             * over the energy bar, and adapting on that kept the gain
+             * hunting - visible in the GUI as an AGC readout that never
+             * settled. */
+            nr_hold = loud ? WT_NR_HOLD_FRAMES
+                           : (nr_hold > 0 ? nr_hold - 1 : 0);
+            if (loud && prev_speech) {
                 /* converge on a consistent output level for speech */
                 float want = WT_AGC_TARGET_PEAK / (in_peak * manual + 1.0f);
                 if (want < WT_AGC_MIN) want = WT_AGC_MIN;
@@ -140,25 +229,71 @@ static void capture_task(void *arg)
             frames = 0; sent = 0; peak = 0; raw_peak = 0; enc_max = 0;
             s_rx_dgrams = 0;
         }
+        /* One VAD verdict per frame, shared by the VOX gate (this frame)
+         * and AGC adaptation (as prev_speech - audio_last_raw_peak() lags a
+         * frame too, so the two line up on the same audio). */
+        bool frame_speech = true;
+        if (vad != NULL && (s_mic_agc || s_tx_mode == WT_TXMODE_VOX)) {
+            frame_speech = fvad_process(vad, pcm, WT_FRAME_SAMPLES) == 1;
+        }
+        prev_speech = frame_speech;
+
         bool tcp_active = (s_tcp_fd >= 0);
         bool have_route = tcp_active || net_group_size() > 0 || net_peer_known();
         bool gate = true;
-        if (s_tx_mode == WT_TXMODE_VOX) {
-            /* transmit only on local speech while our speaker is quiet;
-             * the XMOS AEC keeps speaker audio out of the mic, so the
-             * far end can't hold the gate open. */
+        if (s_tx_mode != WT_TXMODE_ALWAYS) {
+            /* transmit only on local human voice while our speaker is quiet.
+             * The VAD must call the frame speech AND the peak must clear the
+             * floor: the deliberately permissive VAD keys on any speech-like
+             * audio, so the floor is what rejects a TV or hallway chatter,
+             * while the VAD is what rejects loud non-speech clatter. The
+             * XMOS AEC keeps speaker audio out of the mic, so the far end
+             * can't hold the gate open. The VAD sees the post-gain frame; if
+             * the AGC ducked a word's first frame, the VAD may miss it, but
+             * the next frame triggers and the pre-roll ring recovers it. */
             int64_t nowv = esp_timer_get_time();
+            if (fpeak < vox_nf_run) {
+                vox_nf_run = fpeak;
+            }
+            if (++vox_nf_cnt >= WT_NF_WINDOW) {
+                vox_nf += (vox_nf_run - vox_nf) * WT_NF_SMOOTH;
+                vox_nf_run = fpeak;
+                vox_nf_cnt = 0;
+            }
             int32_t th = WT_VOX_PEAK_OF(s_vox_thresh);
-            if (fpeak >= th &&
+            if (s_tx_mode == WT_TXMODE_VOX) {
+                /* voice: VAD verdict AND an adaptive floor (the knob or the
+                 * tracked room level, whichever is higher), debounced */
+                int32_t amb = (int32_t)(vox_nf * WT_NF_SPEECH_MULT
+                                        + WT_NF_SPEECH_MARGIN);
+                if (amb > th) {
+                    th = amb;
+                }
+                vox_run = (frame_speech && fpeak >= th) ? vox_run + 1 : 0;
+            } else {
+                /* gate: the plain knob threshold, single-frame trigger -
+                 * predictable "level above the line = transmitting" */
+                vox_run = (fpeak >= th) ? WT_VOX_OPEN_FRAMES : 0;
+            }
+            if (vox_run >= WT_VOX_OPEN_FRAMES &&
                 nowv - s_last_play_us > WT_VOX_RX_BLOCK_US) {
                 vox_hold_until = nowv + WT_VOX_TX_HANG_US;
             }
             gate = nowv < vox_hold_until;
+            if (gate != vox_gate_prev) {
+                vox_gate_prev = gate;
+                ESP_LOGI(TAG, "vox %s (peak=%d floor=%ld ambient=%d)",
+                         gate ? "open" : "closed", fpeak, (long)th,
+                         (int)vox_nf);
+            }
         }
         s_tx_active = have_route && !s_muted && gate;
-        if (!s_tx_active) {
-            batch_cnt = 0;               /* drop any half-built batch */
-            batch_len = sizeof(wt_header_t);
+        /* in the gated modes a closed gate still encodes, into the ring */
+        bool encode_now = s_tx_active ||
+            (s_tx_mode != WT_TXMODE_ALWAYS && have_route && !s_muted);
+        if (!encode_now) {
+            pre_cnt = 0;
+            batch_drop();                /* drop any half-built batch */
             continue;  /* keep draining I2S; the frame is paced by the XMOS clock */
         }
 
@@ -173,54 +308,56 @@ static void capture_task(void *arg)
                           "WT_OPUS_COMPLEXITY", dt, WT_FRAME_MS);
         }
 
-        if (tcp_active) {
-            if (n > 0 && tcp_send_frame(enc_buf, n)) {
-                sent++;
+        if (!s_tx_active) {
+            /* gate closed: newest frame into the ring, oldest falls out */
+            if (n > 0) {
+                pre_len[pre_head] = (uint16_t)n;
+                memcpy(pre_buf[pre_head], enc_buf, n);
+                pre_head = (pre_head + 1) % WT_VOX_PREROLL;
+                if (pre_cnt < WT_VOX_PREROLL) {
+                    pre_cnt++;
+                }
             }
+            batch_drop();
+            continue;
         }
+
+        /* this tick's frames: pre-roll (oldest first), then the live one */
+        const uint8_t *fr[WT_VOX_PREROLL + 1];
+        int fn[WT_VOX_PREROLL + 1];
+        int nf = 0;
+        for (int i = 0; i < pre_cnt; i++) {
+            int idx = (pre_head - pre_cnt + i + WT_VOX_PREROLL) % WT_VOX_PREROLL;
+            fr[nf] = pre_buf[idx];
+            fn[nf++] = pre_len[idx];
+        }
+        pre_cnt = 0;
+        if (n > 0) {
+            fr[nf] = enc_buf;
+            fn[nf++] = n;
+        }
+
         /* UDP path: group members always; the adopted/manual peer only
          * when no TCP client is being served (TCP wins a 1:1 call). */
         bool udp_route = net_group_size() > 0 ||
                          (!tcp_active && net_peer_known());
+        for (int f = 0; f < nf; f++) {
+            if (tcp_active && tcp_send_frame(fr[f], fn[f])) {
+                sent++;
+            }
+            if (udp_route) {
+                batch_add(fr[f], fn[f], &seq, &sent);
+            }
+        }
         if (!udp_route) {
-            batch_cnt = 0;
-            batch_len = sizeof(wt_header_t);
+            batch_drop();
             continue;
         }
-
-        bool flush = false;
-        if (n > 0) {
-            if (batch_cnt == 0) {
-                batch_seq = seq;
-                batch_t0 = t0;
-            }
-            pkt[batch_len] = (uint8_t)(n & 0xFF);
-            pkt[batch_len + 1] = (uint8_t)(n >> 8);
-            memcpy(pkt + batch_len + 2, enc_buf, n);
-            batch_len += 2 + n;
-            batch_cnt++;
-            seq++;
-            if (batch_cnt >= WT_FRAMES_PER_PKT) {
-                flush = true;
-            }
-        } else if (batch_cnt > 0) {
-            flush = true;  /* DTX gap: keep batched frames consecutive */
-        }
-        if (batch_cnt > 0 && esp_timer_get_time() - batch_t0 > WT_BATCH_FLUSH_US) {
-            flush = true;
-        }
-        if (flush) {
-            wt_header_t hdr = {
-                .magic = WT_MAGIC,
-                .seq = batch_seq,
-                .flags = WT_FLAG_AUDIO,
-                .version = WT_PROTO_VERSION,
-            };
-            memcpy(pkt, &hdr, sizeof(hdr));
-            net_send_all(pkt, batch_len);
-            sent += batch_cnt;
-            batch_cnt = 0;
-            batch_len = sizeof(wt_header_t);
+        /* encode gap or age: flush so batched frames stay consecutive */
+        if (nf == 0 ||
+            (s_batch.cnt > 0 &&
+             esp_timer_get_time() - s_batch.t0 > WT_BATCH_FLUSH_US)) {
+            batch_flush(&sent);
         }
     }
 }
@@ -307,16 +444,17 @@ static void rx_task(void *arg)
                 }
                 send_status_reply(&src);
             } else if (cmd == WT_CTRL_SET_MODE && payload >= 2) {
-                uint8_t m = buf[sizeof(wt_header_t) + 1] ? WT_TXMODE_VOX
-                                                         : WT_TXMODE_ALWAYS;
+                uint8_t m = buf[sizeof(wt_header_t) + 1];
+                if (m > WT_TXMODE_GATE) {
+                    m = WT_TXMODE_ALWAYS;
+                }
                 if (m != s_tx_mode) {
                     s_tx_mode = m;
                     if (s_nvs) {
                         nvs_set_u8(s_nvs, "tx_mode", m);
                         nvs_commit(s_nvs);
                     }
-                    ESP_LOGI(TAG, "tx mode: %s",
-                             m == WT_TXMODE_VOX ? "voice" : "always");
+                    ESP_LOGI(TAG, "tx mode: %s", txmode_name(m));
                 }
                 send_status_reply(&src);
             } else if (cmd == WT_CTRL_SET_THRESH && payload >= 2) {
@@ -634,10 +772,9 @@ static void settings_nvs_load(void)
         s_volume = v;
         ESP_LOGI(TAG, "speaker volume restored: %u%%", (unsigned)v);
     }
-    if (nvs_get_u8(s_nvs, "tx_mode", &v) == ESP_OK && v <= WT_TXMODE_VOX) {
+    if (nvs_get_u8(s_nvs, "tx_mode", &v) == ESP_OK && v <= WT_TXMODE_GATE) {
         s_tx_mode = v;
-        ESP_LOGI(TAG, "tx mode restored: %s",
-                 v == WT_TXMODE_VOX ? "voice" : "always");
+        ESP_LOGI(TAG, "tx mode restored: %s", txmode_name(v));
     }
     if (nvs_get_u8(s_nvs, "vox_th", &v) == ESP_OK && v <= 100) {
         s_vox_thresh = v;
@@ -680,7 +817,7 @@ static void update_led(void)
 static void housekeeping_loop(void)
 {
     gpio_config_t btn_cfg = {
-        .pin_bit_mask = 1ULL << WT_PIN_BUTTON,
+        .pin_bit_mask = (1ULL << WT_PIN_BUTTON) | (1ULL << WT_PIN_BUTTON_SPK),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
     };
@@ -688,6 +825,9 @@ static void housekeeping_loop(void)
 
     bool btn_last = true;
     int64_t btn_edge_us = 0;
+    bool spk_btn_last = true;
+    int64_t spk_btn_edge_us = 0;
+    uint8_t spk_restore = 100;   /* volume to return to after speaker-off */
     int64_t last_keepalive_us = 0;
     int64_t last_discovery_us = 0;
     uint16_t ka_seq = 0;
@@ -703,6 +843,25 @@ static void housekeeping_loop(void)
             ESP_LOGI(TAG, "mic %s", s_muted ? "muted" : "live");
         }
         btn_last = btn;
+
+        /* MUTE button (active low): speaker on/off. Off is volume 0 - the
+         * same convention the GUI uses - so it persists (debounced NVS
+         * save) and shows up in status responses. */
+        bool spk_btn = gpio_get_level(WT_PIN_BUTTON_SPK);
+        if (spk_btn_last && !spk_btn && now - spk_btn_edge_us > 50000) {
+            spk_btn_edge_us = now;
+            if (s_volume > 0) {
+                spk_restore = s_volume;
+                s_volume = 0;
+            } else {
+                s_volume = spk_restore;
+            }
+            s_vol_dirty = true;
+            s_vol_change_us = now;
+            ESP_LOGI(TAG, "speaker %s (vol %u%%)",
+                     s_volume ? "on" : "off", (unsigned)s_volume);
+        }
+        spk_btn_last = spk_btn;
 
         /* Never go radio-silent, and keep the peer's liveness fresh even
          * when DTX suppresses all audio: 1/s unicast keepalive to the peer,

@@ -52,8 +52,11 @@ typedef struct __attribute__((packed)) {
                                     everything below the gate. Persisted. */
 
 #define WT_TXMODE_ALWAYS 0  /* transmit continuously */
-#define WT_TXMODE_VOX    1  /* transmit only on local speech while the far
-                               end is quiet (half-duplex, echo-proof) */
+#define WT_TXMODE_VOX    1  /* transmit only on local human voice (WebRTC
+                               VAD + adaptive floor) while the far end is
+                               quiet (half-duplex, echo-proof) */
+#define WT_TXMODE_GATE   2  /* plain level gate: transmit while the frame
+                               peak exceeds the threshold knob (no VAD) */
 
 #define WT_MAX_MEMBERS   8
 

@@ -66,6 +66,9 @@ Seeed documentation:
 
 ### 1. Install the PC client
 
+Double-click **`pc_client\start_gui.bat`** — it creates the venv and installs
+the dependencies on first run, then starts the GUI. Or by hand:
+
 ```powershell
 cd pc_client
 python -m venv .venv

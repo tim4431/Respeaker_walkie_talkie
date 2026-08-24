@@ -49,7 +49,7 @@ offers a voice-activated TX mode (see §4).
 
 | Task | Core | Prio | Stack | Role |
 |---|---|---|---|---|
-| `capture` | 1 | 10 | 48 KB | I2S read → gain → VOX gate → Opus encode → send |
+| `capture` | 1 | 10 | 48 KB | I2S read → gain → VAD/VOX gate → Opus encode → send |
 | `playback` | 1 | 10 | 48 KB | jitter buffer → Opus decode → volume → I2S write |
 | `udp_rx` | 0 | 9 | 6 KB | UDP audio + control requests |
 | `tcp_srv` | 0 | 9 | 6 KB | TCP 5010 listener (PC calls) |
@@ -74,9 +74,9 @@ flowchart TD
     B --> C["frame peak → mic_level<br/>(status telemetry)"]
     C --> D{"TX mode"}
     D -->|"always"| F["Opus encode"]
-    D -->|"voice"| E{"peak ≥ gate<br/>and speaker quiet?"}
+    D -->|"voice"| E{"VAD says speech<br/>and peak ≥ floor<br/>and speaker quiet?"}
     E -->|"yes — plus 700 ms hangover"| F
-    E -->|"no"| Z["drop frame<br/>(keep draining I2S)"]
+    E -->|"no"| Z["encode into 100 ms<br/>pre-roll ring<br/>(sent when gate opens)"]
     F --> G{"transport"}
     G -->|"TCP client present"| H["len-prefixed opus stream"]
     G -->|"group / peer"| I["batch ≤ 4 frames<br/>+ 8-byte header → UDP"]
@@ -157,7 +157,7 @@ request is answered with a `wt_status_t`.
 | `0x02` | `STATUS_RSP` | `wt_status_t` | — |
 | `0x03` | `SET_PEER` | `u8 cmd, u8 rsv, u16 port, u32 ip` (ip 0 = auto) | yes |
 | `0x04` | `SET_VOL` | `u8` speaker volume 0–100 | yes |
-| `0x05` | `SET_MODE` | `u8` 0 = always TX, 1 = voice (VOX) | yes |
+| `0x05` | `SET_MODE` | `u8` 0 = always TX, 1 = voice (VAD), 2 = level gate | yes |
 | `0x06` | `SET_MUTE` | `u8` 0/1 | **no** (boots unmuted) |
 | `0x07` | `SET_GROUP` | `u8 count` + count × `{u32 ip, u16 port}` | yes |
 | `0x08` | `SET_THRESH` | `u8` VOX gate 0–100 | yes |
@@ -178,7 +178,7 @@ typedef struct __attribute__((packed)) {
     char     hostname[24];
     // --- optional extensions ---
     uint8_t  volume;           // 0-100
-    uint8_t  tx_mode;          // 0 always, 1 voice
+    uint8_t  tx_mode;          // 0 always, 1 voice (VAD), 2 level gate
     uint8_t  tx_active;        // transmitting right now
     uint8_t  rx_active;        // playing far-end audio right now
     uint8_t  member_count;
@@ -195,17 +195,50 @@ typedef struct __attribute__((packed)) {
 
 ## 4. Voice-activated transmission (VOX)
 
-In **always** mode a node transmits every frame. In **voice** mode it
-transmits only while it hears speech *and* its own speaker is quiet, which
-prevents a speaker→mic loop on hardware without echo cancellation.
+A device has three TX modes. In **always** mode it transmits every frame.
+In **voice** mode it transmits only while it hears human speech (VAD, below)
+*and* its own speaker is quiet. In **gate** mode the trigger is the plain
+level threshold only — single-frame, no VAD, no adaptive floor — so
+"level above the dashed line = transmitting" holds exactly. Both gated
+modes share the hangover/RX-block timing and the pre-roll ring. The PC
+client has no VAD, so its only gated mode is its RMS gate.
+
+**The device's speech test is a real VAD, not a loudness gate.** Each 20 ms
+frame goes through the WebRTC voice-activity detector (vendored
+[libfvad](https://github.com/dpirch/libfvad) in `components/libfvad`, a
+fixed-point GMM classifier fed the 48 kHz frame directly, aggressiveness
+`WT_VAD_MODE` = 2). The gate opens only when the VAD calls the frame speech
+**and** its peak clears the threshold: the deliberately permissive VAD is
+what rejects loud non-speech (clatter, keyboards, door slams), while the
+energy floor is what rejects distant speech-like audio (TV, hallway) that
+the VAD would key on. A single qualifying frame is not enough: opening TX
+(and re-arming the hangover) takes `WT_VOX_OPEN_FRAMES` = 3 *consecutive*
+qualifying frames (60 ms) — the VAD throws isolated false positives on
+residual noise, and without the run requirement one hit per 700 ms chained
+the gate open forever after speech ended. Gate transitions are logged
+(`vox open/closed`) on the serial console. If `fvad_new()` ever fails, VOX
+degrades to the old peak-only gate. The PC client still uses a plain RMS
+gate.
+
+**Pre-roll.** While the gate is closed the device keeps encoding every frame
+into a ring of the newest `WT_VOX_PREROLL` = 5 frames (100 ms). When the
+gate opens the ring is sent first, so the word that triggered the VAD
+arrives with its onset intact instead of clipped. Sequence numbers are
+assigned at send time, so a gate-closed gap costs no seq numbers and the
+receiver never mistakes it for packet loss.
 
 The 0–100 gate knob maps quadratically, so the useful low range is not
 crammed into a few pixels:
 
-| | mapping | gate 0 | gate 30 (default) | gate 60 | gate 100 |
-|---|---|---|---|---|---|
-| Device (frame peak) | `150 + gate² × 2` | 150 | 1 950 | 7 350 | 20 150 |
-| PC client (RMS) | `20 + gate² × 0.3` | 20 | 290 | 1 100 | 3 020 |
+| | mapping | gate 0 | gate 15 | gate 30 | gate 60 | gate 100 |
+|---|---|---|---|---|---|---|
+| Device (frame peak) | `150 + gate² × 2` | 150 | 600 | 1 950 | 7 350 | 20 150 |
+| PC client (RMS) | `20 + gate² × 0.3` | 20 | 88 | 290 | 1 100 | 3 020 |
+
+The device default is **15**: with the VAD doing the speech/non-speech work,
+the floor only needs to clear room tone. (It was 30 when the peak was the
+only trigger; units flashed before the change keep their NVS-stored value
+until `SET_THRESH` updates it.) The PC client default remains 30.
 
 Reference levels: post-AGC speech peaks ~10 000–30 000; a quiet room is a
 few hundred. On the PC, speech is typically RMS 500–3 000, a quiet room
@@ -299,7 +332,7 @@ flowchart TD
 |---|---|---|
 | `wifi_ssid`, `wifi_pass` | WiFi credentials; **override the compiled-in values** | USB console |
 | `spk_vol` | speaker volume 0–100 | `SET_VOL` |
-| `tx_mode` | 0 always / 1 voice | `SET_MODE` |
+| `tx_mode` | 0 always / 1 voice / 2 gate | `SET_MODE` |
 | `vox_th` | VOX gate 0–100 | `SET_THRESH` |
 | `mic_gain` | mic gain 0–200 % | `SET_GAIN` |
 | `mic_agc` | auto gain + noise gate on/off | `SET_AGC` |
@@ -401,7 +434,8 @@ Pinout is fixed by the kit wiring:
 | Mic data (XMOS → ESP) | 44 |
 | Speaker data (ESP → XMOS) | 43 |
 | WS2812 LED | 1 |
-| USER button | 3 |
+| USER button (mic mute) | 3 |
+| MUTE button (speaker on/off) | 4 |
 
 LED: orange = connecting to WiFi, blue = no peer, green = linked,
 purple = muted.

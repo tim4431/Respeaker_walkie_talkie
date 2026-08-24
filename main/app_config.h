@@ -28,6 +28,9 @@
 
 #define WT_PIN_LED          GPIO_NUM_1   /* on-board WS2812 */
 #define WT_PIN_BUTTON       GPIO_NUM_3   /* USER button (D2), active low */
+/* The board's MUTE button, routed to the XIAO with the same solder jumper
+ * scheme as USER (MUTE pad -> D3). Toggles the speaker on/off. */
+#define WT_PIN_BUTTON_SPK   GPIO_NUM_4   /* MUTE button (D3), active low */
 
 /* Jitter buffer tuning */
 #define WT_JB_SLOTS         32
@@ -39,16 +42,37 @@
 #define WT_KEEPALIVE_US     (1 * 1000 * 1000)
 #define WT_DISCOVERY_US     (5 * 1000 * 1000)
 
-/* Device-side VOX (WT_TXMODE_VOX): open TX when the frame's peak exceeds
- * the threshold and the speaker has been quiet for RX_BLOCK; hold TX open
- * for HANG. The 0-100 knob (WT_CTRL_SET_THRESH, persisted) maps
- * quadratically onto peak16 so the low end stays fine-grained:
- *   peak = 150 + thresh^2 * 2   (0 -> 150, 30 -> 1950, 100 -> 20150)
- * Post-AGC speech peaks are ~10000-30000; a quiet room is a few hundred. */
-#define WT_VOX_THRESH_DEFAULT 30
+/* Device-side VOX (WT_TXMODE_VOX): open TX when the WebRTC VAD (libfvad)
+ * classifies the frame as speech AND the frame's peak exceeds the threshold,
+ * while the speaker has been quiet for RX_BLOCK; hold TX open for HANG.
+ * The VAD rejects loud non-speech (clatter, keyboards); the energy floor
+ * rejects distant speech (TV, hallway) that the deliberately permissive VAD
+ * would otherwise key on. The 0-100 knob (WT_CTRL_SET_THRESH, persisted)
+ * maps quadratically onto peak16 so the low end stays fine-grained:
+ *   peak = 150 + thresh^2 * 2   (0 -> 150, 15 -> 600, 100 -> 20150)
+ * Post-AGC speech peaks are ~10000-30000; a quiet room is a few hundred.
+ * Default was 30 when the peak was the only trigger; with the VAD doing the
+ * speech/non-speech work the floor only needs to clear the room tone. */
+#define WT_VOX_THRESH_DEFAULT 15
 #define WT_VOX_PEAK_OF(th)  (150 + (int32_t)(th) * (int32_t)(th) * 2)
 #define WT_VOX_TX_HANG_US   (700 * 1000)
 #define WT_VOX_RX_BLOCK_US  (400 * 1000)
+/* fvad aggressiveness 0-3: higher = stricter speech test, more onset misses.
+ * 3 (strictest): measured on unit 1, mode 2 still passed the XMOS-AGC-pumped
+ * room noise as speech; the hold + pre-roll absorb mode 3's onset misses. */
+#define WT_VAD_MODE         3
+/* A single VAD hit must not open TX or re-arm the hangover: the VAD throws
+ * isolated false positives on residual noise, and one hit per 700 ms was
+ * enough to chain the gate open forever after speech ended. Real speech is
+ * voiced for many consecutive frames, so require a short unbroken run (VAD
+ * speech AND peak over the floor). The onset frames the debounce consumes
+ * are recovered by the pre-roll ring. */
+#define WT_VOX_OPEN_FRAMES  3     /* 60 ms of consecutive speech */
+/* While the VOX gate is closed every frame is still encoded into a ring of
+ * the most recent PREROLL frames; on gate open the ring is sent first, so
+ * the first word's onset (the frames that triggered the VAD) isn't clipped.
+ * Must leave room in the TX packet: bounded by WT_MAX_BATCH per datagram. */
+#define WT_VOX_PREROLL      5     /* 100 ms */
 
 /* Group audio: one active speaker at a time - a UDP source owns playback
  * until it has been silent this long, then another source may take over. */

@@ -9,7 +9,8 @@ debug effectively. Read this in full before touching anything.
 Full-duplex intercom on Seeed ReSpeaker Lite kits (XMOS XU316 audio front-end
 + XIAO ESP32-S3). The XMOS does AEC/NS/AGC and is **I2S clock master** (48 kHz,
 32-bit stereo slots; ESP32 is slave). Firmware is ESP-IDF (`main/`), PC client
-is Python (`pc_client/`: `walkie_pc.py` CLI + `walkie_gui.py` tkinter GUI).
+is Python (`pc_client/`: `walkie_pc.py` CLI + `walkie_gui.py` Qt/PySide6 GUI,
+launched with `start_gui.bat`).
 
 Audio: Opus 48 kHz mono, 20 ms frames (960 samples), VOIP mode, wideband cap,
 DTX **off**. PC↔device audio runs over **TCP port 5010** (`[u16 len][opus]`
@@ -31,11 +32,15 @@ registers the monitor socket's addr in each device's member list and runs
 a `WalkieClient(targets=[...], use_tcp=False)` on the shared socket.
 
 Control on UDP 5004 with `WT_FLAG_CTRL`: `SET_VOL` (0x04, volume 0–100,
-NVS), `SET_MODE` (0x05, 0 = always transmit, 1 = VOX/voice-activated, NVS),
+NVS), `SET_MODE` (0x05, 0 = always transmit, 1 = voice/VAD, 2 = plain level
+gate, NVS),
 `SET_MUTE` (0x06, not persisted), `SET_GROUP` (0x07), `SET_THRESH` (0x08, VOX
 TX threshold 0–100, NVS; higher = louder speech needed, mapped quadratically
-onto peak16 by `WT_VOX_PEAK_OF`: `150 + thresh² * 2`, default 30 ≈ peak
-1950), `SET_GAIN` (0x09, mic gain 0–200 %, NVS; saturating digital gain
+onto peak16 by `WT_VOX_PEAK_OF`: `150 + thresh² * 2`, default 15 ≈ peak 600.
+On-device the threshold is only an energy floor AND'ed with the WebRTC VAD
+(`components/libfvad`) — the VAD decides speech vs non-speech; units flashed
+before the VAD change keep their old NVS value, typically 30),
+`SET_GAIN` (0x09, mic gain 0–200 %, NVS; saturating digital gain
 applied to captured samples before level/VOX/encode — so gain also shifts
 where the gate opens), plus status/peer as before. Control never affects peer
 adoption. Every ctrl request is answered with `wt_status_t`, which appends
@@ -183,7 +188,9 @@ TCP identity: connect to `<ip>:5010`, first frame is the `WTKI-...` build tag
   PCB pool (default 60 s MSL parks every closed conn in TIME_WAIT for 2 min).
 - WiFi power save is disabled (`WIFI_PS_NONE`) — do not re-enable.
 - I2S pins (fixed by kit wiring): BCLK 8, WS 7, mic-in 44, spk-out 43;
-  WS2812 LED GPIO1, USER button GPIO3. LED: orange=WiFi connecting,
+  WS2812 LED GPIO1, USER button GPIO3 (mic mute), MUTE button GPIO4
+  (speaker on/off; needs the board's MUTE pad jumpered to D3, same scheme as
+  USER→D2). LED: orange=WiFi connecting,
   blue=no peer, green=linked, purple=muted.
 - Samples are MSB-aligned in 32-bit slots (`>>16` to int16); channel 0 is the
   processed (ASR) mic.
