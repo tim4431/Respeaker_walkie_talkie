@@ -28,6 +28,9 @@
 
 #define WT_PIN_LED          GPIO_NUM_1   /* on-board WS2812 */
 #define WT_PIN_BUTTON       GPIO_NUM_3   /* USER button (D2), active low */
+/* The board's MUTE button, routed to the XIAO with the same solder jumper
+ * scheme as USER (MUTE pad -> D3). Toggles the speaker on/off. */
+#define WT_PIN_BUTTON_SPK   GPIO_NUM_4   /* MUTE button (D3), active low */
 
 /* Jitter buffer tuning */
 #define WT_JB_SLOTS         32

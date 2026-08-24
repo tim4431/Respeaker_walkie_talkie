@@ -434,7 +434,8 @@ Pinout is fixed by the kit wiring:
 | Mic data (XMOS → ESP) | 44 |
 | Speaker data (ESP → XMOS) | 43 |
 | WS2812 LED | 1 |
-| USER button | 3 |
+| USER button (mic mute) | 3 |
+| MUTE button (speaker on/off) | 4 |
 
 LED: orange = connecting to WiFi, blue = no peer, green = linked,
 purple = muted.

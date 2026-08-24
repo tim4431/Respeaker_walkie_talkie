@@ -1,6 +1,7 @@
 sounddevice
 zeroconf
 pyserial
+PySide6   # walkie_gui.py (Qt); not needed for the walkie_pc.py CLI
 # PyPI's PyOgg release is too old for OpusEncoder/OpusDecoder; the dev
 # version bundles the needed opus DLLs on Windows.
 PyOgg @ git+https://github.com/TeamPyOgg/PyOgg

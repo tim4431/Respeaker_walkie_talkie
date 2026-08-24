@@ -9,7 +9,8 @@ debug effectively. Read this in full before touching anything.
 Full-duplex intercom on Seeed ReSpeaker Lite kits (XMOS XU316 audio front-end
 + XIAO ESP32-S3). The XMOS does AEC/NS/AGC and is **I2S clock master** (48 kHz,
 32-bit stereo slots; ESP32 is slave). Firmware is ESP-IDF (`main/`), PC client
-is Python (`pc_client/`: `walkie_pc.py` CLI + `walkie_gui.py` tkinter GUI).
+is Python (`pc_client/`: `walkie_pc.py` CLI + `walkie_gui.py` Qt/PySide6 GUI,
+launched with `start_gui.bat`).
 
 Audio: Opus 48 kHz mono, 20 ms frames (960 samples), VOIP mode, wideband cap,
 DTX **off**. PC↔device audio runs over **TCP port 5010** (`[u16 len][opus]`
@@ -187,7 +188,9 @@ TCP identity: connect to `<ip>:5010`, first frame is the `WTKI-...` build tag
   PCB pool (default 60 s MSL parks every closed conn in TIME_WAIT for 2 min).
 - WiFi power save is disabled (`WIFI_PS_NONE`) — do not re-enable.
 - I2S pins (fixed by kit wiring): BCLK 8, WS 7, mic-in 44, spk-out 43;
-  WS2812 LED GPIO1, USER button GPIO3. LED: orange=WiFi connecting,
+  WS2812 LED GPIO1, USER button GPIO3 (mic mute), MUTE button GPIO4
+  (speaker on/off; needs the board's MUTE pad jumpered to D3, same scheme as
+  USER→D2). LED: orange=WiFi connecting,
   blue=no peer, green=linked, purple=muted.
 - Samples are MSB-aligned in 32-bit slots (`>>16` to int16); channel 0 is the
   processed (ASR) mic.

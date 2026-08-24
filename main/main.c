@@ -817,7 +817,7 @@ static void update_led(void)
 static void housekeeping_loop(void)
 {
     gpio_config_t btn_cfg = {
-        .pin_bit_mask = 1ULL << WT_PIN_BUTTON,
+        .pin_bit_mask = (1ULL << WT_PIN_BUTTON) | (1ULL << WT_PIN_BUTTON_SPK),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
     };
@@ -825,6 +825,9 @@ static void housekeeping_loop(void)
 
     bool btn_last = true;
     int64_t btn_edge_us = 0;
+    bool spk_btn_last = true;
+    int64_t spk_btn_edge_us = 0;
+    uint8_t spk_restore = 100;   /* volume to return to after speaker-off */
     int64_t last_keepalive_us = 0;
     int64_t last_discovery_us = 0;
     uint16_t ka_seq = 0;
@@ -840,6 +843,25 @@ static void housekeeping_loop(void)
             ESP_LOGI(TAG, "mic %s", s_muted ? "muted" : "live");
         }
         btn_last = btn;
+
+        /* MUTE button (active low): speaker on/off. Off is volume 0 - the
+         * same convention the GUI uses - so it persists (debounced NVS
+         * save) and shows up in status responses. */
+        bool spk_btn = gpio_get_level(WT_PIN_BUTTON_SPK);
+        if (spk_btn_last && !spk_btn && now - spk_btn_edge_us > 50000) {
+            spk_btn_edge_us = now;
+            if (s_volume > 0) {
+                spk_restore = s_volume;
+                s_volume = 0;
+            } else {
+                s_volume = spk_restore;
+            }
+            s_vol_dirty = true;
+            s_vol_change_us = now;
+            ESP_LOGI(TAG, "speaker %s (vol %u%%)",
+                     s_volume ? "on" : "off", (unsigned)s_volume);
+        }
+        spk_btn_last = spk_btn;
 
         /* Never go radio-silent, and keep the peer's liveness fresh even
          * when DTX suppresses all audio: 1/s unicast keepalive to the peer,
